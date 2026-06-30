@@ -1,0 +1,96 @@
+<?xml version="1.0"?>
+<info>
+	<id>monitoring_request_manager</id>
+	<name>Monitoring Request Manager</name>
+	<summary>Управление сборами файлов от образовательных организаций</summary>
+	<description><![CDATA[
+Nextcloud ExApp для создания кампаний сбора файлов, папок организаций,
+публичных upload-ссылок, таблиц рассылки, проверки загруженных файлов,
+preview/apply массовых операций и журнала действий.
+	]]></description>
+	<version>0.1.0</version>
+	<licence>MIT</licence>
+	<author>ExApp Monitoring Team</author>
+	<namespace>MonitoringRequestManager</namespace>
+	<category>tools</category>
+	<dependencies>
+		<nextcloud min-version="30" max-version="35"/>
+	</dependencies>
+	<external-app>
+		<docker-install>
+			<registry>ghcr.io</registry>
+			<image>example/monitoring-request-manager</image>
+			<image-tag>0.1.0</image-tag>
+		</docker-install>
+		<environment-variables>
+			<variable>
+				<name>MRM_NC_BASE_URL</name>
+				<display-name>Nextcloud base URL</display-name>
+				<description>Internal URL of the Nextcloud container, for example http://nextcloud</description>
+			</variable>
+			<variable>
+				<name>MRM_NC_USER</name>
+				<display-name>Technical WebDAV user</display-name>
+				<description>User whose WebDAV and OCS credentials are used by the ExApp</description>
+			</variable>
+			<variable>
+				<name>MRM_NC_APP_PASSWORD</name>
+				<display-name>App password / token</display-name>
+				<description>App password for the technical WebDAV user. Prefer Docker secrets in production.</description>
+			</variable>
+			<variable>
+				<name>MRM_ROOT_PATH</name>
+				<display-name>Root monitoring folder</display-name>
+				<description>All file operations are restricted to this Nextcloud path</description>
+				<default>/Мониторинги</default>
+			</variable>
+			<variable>
+				<name>MRM_DATABASE_URL</name>
+				<display-name>Database URL</display-name>
+				<description>SQLAlchemy URL. Defaults to SQLite inside the ExApp persistent volume.</description>
+			</variable>
+		</environment-variables>
+		<routes>
+			<route>
+				<url>^/$</url>
+				<verb>GET</verb>
+				<access_level>USER</access_level>
+			</route>
+			<route>
+				<url>^/api/.*$</url>
+				<verb>GET</verb>
+				<access_level>USER</access_level>
+			</route>
+			<route>
+				<url>^/api/.*$</url>
+				<verb>POST</verb>
+				<access_level>USER</access_level>
+			</route>
+			<route>
+				<url>^/api/.*$</url>
+				<verb>PUT</verb>
+				<access_level>USER</access_level>
+			</route>
+			<route>
+				<url>^/api/.*$</url>
+				<verb>DELETE</verb>
+				<access_level>USER</access_level>
+			</route>
+			<route>
+				<url>^/js/.*$</url>
+				<verb>GET</verb>
+				<access_level>USER</access_level>
+			</route>
+			<route>
+				<url>^/css/.*$</url>
+				<verb>GET</verb>
+				<access_level>USER</access_level>
+			</route>
+			<route>
+				<url>^/img/.*$</url>
+				<verb>GET</verb>
+				<access_level>USER</access_level>
+			</route>
+		</routes>
+	</external-app>
+</info>
