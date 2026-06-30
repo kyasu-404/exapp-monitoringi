@@ -1,16 +1,16 @@
 <?xml version="1.0"?>
 <info>
-	<id>monitoring_request_manager</id>
-	<name>Monitoring Request Manager</name>
-	<summary>Управление сборами файлов от образовательных организаций</summary>
+	<id>oo_file_collector</id>
+	<name>Сбор файлов ОО</name>
+	<summary>Сбор файлов от образовательных организаций</summary>
 	<description><![CDATA[
 Nextcloud ExApp для создания кампаний сбора файлов, папок организаций,
 публичных upload-ссылок, таблиц рассылки, проверки загруженных файлов,
 preview/apply массовых операций и журнала действий.
 	]]></description>
-	<version>0.1.0</version>
+	<version>1.0.0</version>
 	<licence>MIT</licence>
-	<author>ExApp Monitoring Team</author>
+	<author>kyasu-404</author>
 	<namespace>MonitoringRequestManager</namespace>
 	<category>tools</category>
 	<dependencies>
@@ -19,8 +19,8 @@ preview/apply массовых операций и журнала действи
 	<external-app>
 		<docker-install>
 			<registry>ghcr.io</registry>
-			<image>example/monitoring-request-manager</image>
-			<image-tag>0.1.0</image-tag>
+			<image>kyasu-404/oo_file_collector</image>
+			<image-tag>1.0.0</image-tag>
 		</docker-install>
 		<environment-variables>
 			<variable>
