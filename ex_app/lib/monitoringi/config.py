@@ -9,8 +9,8 @@ from pathlib import Path
 
 def _default_storage_dir() -> Path:
     return Path(
-        os.getenv("MRM_STORAGE_DIR")
-        or os.getenv("APP_PERSISTENT_STORAGE")
+        os.getenv("APP_PERSISTENT_STORAGE")
+        or os.getenv("MRM_STORAGE_DIR")
         or os.getenv("APP_DATA_DIR")
         or "/tmp/monitoring-request-manager"
     )
@@ -23,6 +23,10 @@ class Settings:
     nc_base_url: str | None
     nc_user: str | None
     nc_app_password: str | None
+    app_secret: str | None
+    app_id: str | None
+    app_version: str | None
+    aa_version: str | None
     root_path: str
     duplicates_folder: str
     invalid_folder: str
@@ -39,9 +43,13 @@ def load_settings() -> Settings:
     return Settings(
         storage_dir=storage_dir,
         database_url=database_url,
-        nc_base_url=os.getenv("MRM_NC_BASE_URL"),
+        nc_base_url=os.getenv("MRM_NC_BASE_URL") or os.getenv("NEXTCLOUD_URL"),
         nc_user=os.getenv("MRM_NC_USER"),
         nc_app_password=os.getenv("MRM_NC_APP_PASSWORD"),
+        app_secret=os.getenv("APP_SECRET"),
+        app_id=os.getenv("APP_ID"),
+        app_version=os.getenv("APP_VERSION"),
+        aa_version=os.getenv("AA_VERSION"),
         root_path=os.getenv("MRM_ROOT_PATH", "/Мониторинги"),
         duplicates_folder=os.getenv("MRM_DUPLICATES_FOLDER", "_Дубли"),
         invalid_folder=os.getenv("MRM_INVALID_FOLDER", "_Неподходящие"),
@@ -53,4 +61,3 @@ def load_settings() -> Settings:
 
 
 SETTINGS = load_settings()
-

@@ -75,15 +75,27 @@ async def img_asset(path: str) -> FileResponse:
 def enabled_handler(enabled: bool, nc: NextcloudApp) -> str:
     try:
         if enabled:
+            nc.ui.top_menu.register("main", "Сбор файлов ОО")
+            nc.ui.resources.set_script("top_menu", "main", "js/monitoringi-main")
+            nc.ui.resources.set_style("top_menu", "main", "css/monitoringi")
+            nc.ui.files_dropdown_menu.register_ex(
+                "open_oo_file_collector",
+                "Сбор файлов ОО",
+                "api/files-actions/open",
+                mime="httpd/unix-directory",
+                permissions=31,
+                order=80,
+            )
             nc.log(LogLvl.WARNING, "Monitoring Request Manager enabled")
         else:
+            nc.ui.top_menu.unregister("main")
+            nc.ui.files_dropdown_menu.unregister("open_oo_file_collector")
             nc.log(LogLvl.WARNING, "Monitoring Request Manager disabled")
-    except Exception:
-        return ""
+    except Exception as exc:
+        return str(exc)
     return ""
 
 
 if __name__ == "__main__":
     os.chdir(Path(__file__).parent)
     run_app("main:APP", log_level=os.getenv("MRM_LOG_LEVEL", "info"))
-

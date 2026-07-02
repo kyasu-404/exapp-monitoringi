@@ -8,7 +8,7 @@ Nextcloud ExApp для создания кампаний сбора файлов
 публичных upload-ссылок, таблиц рассылки, проверки загруженных файлов,
 preview/apply массовых операций и журнала действий.
 	]]></description>
-	<version>1.0.0</version>
+	<version>1.0.5</version>
 	<licence>MIT</licence>
 	<author>kyasu-404</author>
 	<namespace>MonitoringRequestManager</namespace>
@@ -20,24 +20,9 @@ preview/apply массовых операций и журнала действи
 		<docker-install>
 			<registry>ghcr.io</registry>
 			<image>kyasu-404/oo_file_collector</image>
-			<image-tag>1.0.0</image-tag>
+			<image-tag>1.0.5</image-tag>
 		</docker-install>
 		<environment-variables>
-			<variable>
-				<name>MRM_NC_BASE_URL</name>
-				<display-name>Nextcloud base URL</display-name>
-				<description>Internal URL of the Nextcloud container, for example http://nextcloud</description>
-			</variable>
-			<variable>
-				<name>MRM_NC_USER</name>
-				<display-name>Technical WebDAV user</display-name>
-				<description>User whose WebDAV and OCS credentials are used by the ExApp</description>
-			</variable>
-			<variable>
-				<name>MRM_NC_APP_PASSWORD</name>
-				<display-name>App password / token</display-name>
-				<description>App password for the technical WebDAV user. Prefer Docker secrets in production.</description>
-			</variable>
 			<variable>
 				<name>MRM_ROOT_PATH</name>
 				<display-name>Root monitoring folder</display-name>

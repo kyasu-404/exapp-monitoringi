@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import xml.etree.ElementTree as ET
+from base64 import b64encode
 from dataclasses import dataclass
 from datetime import date, datetime, timezone
 from email.utils import parsedate_to_datetime
@@ -22,8 +23,12 @@ DAV_NS = {"d": "DAV:", "nc": "http://nextcloud.org/ns"}
 class NextcloudCredentials:
     base_url: str
     user: str
-    app_password: str
     root_path: str
+    app_secret: str | None = None
+    app_id: str | None = None
+    app_version: str | None = None
+    aa_version: str | None = None
+    app_password: str | None = None
 
 
 @dataclass(frozen=True)
@@ -43,17 +48,34 @@ def configured_credentials(overrides: dict | None = None) -> NextcloudCredential
     user = overrides.get("nc_user") or SETTINGS.nc_user
     app_password = overrides.get("nc_app_password") or SETTINGS.nc_app_password
     root_path = overrides.get("root_path") or SETTINGS.root_path
-    if not base_url or not user or not app_password:
+    app_secret = overrides.get("app_secret") or SETTINGS.app_secret
+    app_id = overrides.get("app_id") or SETTINGS.app_id
+    app_version = overrides.get("app_version") or SETTINGS.app_version
+    aa_version = overrides.get("aa_version") or SETTINGS.aa_version
+    if not base_url or not user:
         raise NextcloudApiError(
             "NEXTCLOUD_SETTINGS_INCOMPLETE",
             "Не заполнены настройки подключения к Nextcloud API.",
             400,
         )
+    if not app_password and not (app_secret and app_id and app_version):
+        raise NextcloudApiError(
+            "NEXTCLOUD_SETTINGS_INCOMPLETE",
+            "Не найден AppAPI secret для подключения к Nextcloud API.",
+            400,
+        )
+    base_url = base_url.rstrip("/")
+    if base_url.endswith("/index.php"):
+        base_url = base_url.removesuffix("/index.php")
     return NextcloudCredentials(
-        base_url=base_url.rstrip("/"),
+        base_url=base_url,
         user=user,
-        app_password=app_password,
         root_path=normalize_nc_path(root_path),
+        app_secret=app_secret,
+        app_id=app_id,
+        app_version=app_version,
+        aa_version=aa_version or "2.2.0",
+        app_password=app_password,
     )
 
 
@@ -76,11 +98,25 @@ def _parse_http_date(value: str | None) -> datetime | None:
 class NextcloudClient:
     def __init__(self, credentials: NextcloudCredentials | None = None) -> None:
         self.credentials = credentials or configured_credentials()
+        headers = {"User-Agent": "ExApp/oo_file_collector"}
+        auth = None
+        if self.credentials.app_password:
+            auth = (self.credentials.user, self.credentials.app_password)
+        else:
+            auth_value = b64encode(f"{self.credentials.user}:{self.credentials.app_secret}".encode()).decode()
+            headers.update(
+                {
+                    "AA-VERSION": self.credentials.aa_version or "2.2.0",
+                    "EX-APP-ID": self.credentials.app_id or "oo_file_collector",
+                    "EX-APP-VERSION": self.credentials.app_version or "0.0.0",
+                    "AUTHORIZATION-APP-API": auth_value,
+                }
+            )
         self._client = httpx.AsyncClient(
             base_url=self.credentials.base_url,
-            auth=(self.credentials.user, self.credentials.app_password),
+            auth=auth,
             timeout=SETTINGS.request_timeout,
-            headers={"User-Agent": "monitoring-request-manager/0.1.0"},
+            headers=headers,
         )
 
     async def aclose(self) -> None:

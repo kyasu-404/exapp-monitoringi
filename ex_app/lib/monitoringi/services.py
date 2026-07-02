@@ -12,6 +12,7 @@ from openpyxl import load_workbook
 from sqlmodel import Session, delete, select
 
 from .algorithms import FileCandidate, classify_files, extension_of, organization_sort_key, plan_renames
+from .config import SETTINGS
 from .models import (
     AuditLog,
     BatchStatus,
@@ -33,16 +34,55 @@ from .reports import render_template
 from .security import campaign_folder_path, ensure_under_root, join_nc_path, organization_folder_path
 
 RUSSIAN_COLUMNS = {
+    "Тип ОУ": "type",
     "Тип": "type",
+    "Номер": "code",
     "Префикс": "prefix",
     "Код": "code",
     "Название": "display_name",
+    "Email": "email",
     "Почта": "email",
     "Доп. почты": "extra_emails",
     "Алиасы": "aliases",
     "Активна": "active",
     "Примечание": "notes",
 }
+
+ORGANIZATION_TYPE_LABELS = {
+    "school": "Школы",
+    "kindergarten": "Сады",
+    "odo": "ОДО",
+    "udod": "УДОДы",
+}
+
+ORGANIZATION_TYPE_ALIASES = {
+    "school": "school",
+    "schools": "school",
+    "школа": "school",
+    "школы": "school",
+    "сад": "kindergarten",
+    "сады": "kindergarten",
+    "детский сад": "kindergarten",
+    "kindergarten": "kindergarten",
+    "odo": "odo",
+    "одо": "odo",
+    "udod": "udod",
+    "удод": "udod",
+    "удоды": "udod",
+}
+
+
+def normalize_organization_type(value: Any) -> str:
+    key = str(value or "school").strip().casefold()
+    normalized = ORGANIZATION_TYPE_ALIASES.get(key, key or "school")
+    if normalized in ORGANIZATION_TYPE_LABELS or normalized == "other":
+        return normalized
+    return "school"
+
+
+def organization_type_label(value: Any) -> str:
+    normalized = normalize_organization_type(value)
+    return ORGANIZATION_TYPE_LABELS.get(normalized, str(value or ""))
 
 
 def current_user_id(headers: dict[str, str]) -> str | None:
@@ -101,12 +141,13 @@ def update_settings(session: Session, values: dict[str, Any]) -> dict[str, Any]:
     return settings_map(session)
 
 
-def nextcloud_overrides(session: Session) -> dict[str, Any]:
+def nextcloud_overrides(session: Session, user_id: str | None = None) -> dict[str, Any]:
     values = settings_map(session, include_secret=True)
+    use_legacy_credentials = not SETTINGS.app_secret
     return {
         "nc_base_url": values.get("nc_base_url"),
-        "nc_user": values.get("nc_user"),
-        "nc_app_password": values.get("nc_app_password"),
+        "nc_user": user_id or (values.get("nc_user") if use_legacy_credentials else None),
+        "nc_app_password": values.get("nc_app_password") if use_legacy_credentials else None,
         "root_path": values.get("root_path"),
     }
 
@@ -192,11 +233,13 @@ def _normalize_import_row(raw: dict[str, Any]) -> dict[str, Any] | None:
     display_name = str(raw.get("display_name") or "").strip()
     if not code and not display_name:
         return None
+    code = code or display_name
+    display_name = display_name or code
     return {
-        "type": str(raw.get("type") or "other").strip() or "other",
+        "type": normalize_organization_type(raw.get("type")),
         "prefix": str(raw.get("prefix") or "").strip() or None,
         "code": code,
-        "display_name": display_name or code,
+        "display_name": display_name,
         "short_name": str(raw.get("short_name") or "").strip() or None,
         "email": str(raw.get("email") or "").strip() or None,
         "extra_emails": _split_list(raw.get("extra_emails")),
@@ -208,25 +251,18 @@ def _normalize_import_row(raw: dict[str, Any]) -> dict[str, Any] | None:
 
 def validate_organization_rows(session: Session, rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     seen_type_code: set[tuple[str, str]] = set()
-    seen_email: set[str] = set()
     result: list[dict[str, Any]] = []
     existing = session.exec(select(Organization)).all()
     existing_type_code = {(org.type.value, org.code): org.id for org in existing}
-    existing_emails = {org.email.casefold(): org.id for org in existing if org.email}
     for index, row in enumerate(rows, start=2):
         errors: list[str] = []
         type_code = (str(row.get("type")), str(row.get("code")))
-        email = (row.get("email") or "").casefold()
         if not row.get("code"):
             errors.append("EMPTY_CODE")
         if type_code in seen_type_code:
             errors.append("DUPLICATE_ORGANIZATION_IN_FILE")
         if type_code in existing_type_code:
             errors.append("DUPLICATE_ORGANIZATION")
-        if email:
-            if email in seen_email or email in existing_emails:
-                errors.append("DUPLICATE_EMAIL")
-            seen_email.add(email)
         seen_type_code.add(type_code)
         result.append({"row_number": index, "data": row, "errors": errors})
     return result
@@ -270,6 +306,28 @@ def create_campaign_orgs(session: Session, campaign: Campaign, organizations: li
         result.append(item)
     session.commit()
     return result
+
+
+def sync_campaign_orgs(session: Session, campaign: Campaign, organizations: list[Organization]) -> list[CampaignOrganization]:
+    existing = {
+        item.organization_id: item
+        for item in session.exec(select(CampaignOrganization).where(CampaignOrganization.campaign_id == campaign.id)).all()
+    }
+    changed = False
+    for org in organizations:
+        if org.id in existing:
+            continue
+        item = CampaignOrganization(
+            campaign_id=campaign.id,
+            organization_id=org.id,
+            folder_path=organization_folder_path(campaign.campaign_folder_path, org.display_name or org.code),
+        )
+        session.add(item)
+        existing[org.id] = item
+        changed = True
+    if changed:
+        session.commit()
+    return list(existing.values())
 
 
 def create_batch(
@@ -360,12 +418,47 @@ async def apply_batch(session: Session, batch: OperationBatch, client: Nextcloud
     return batch
 
 
-def planned_folder_items(campaign: Campaign, campaign_orgs: list[CampaignOrganization]) -> list[dict[str, Any]]:
-    items = [{"action": "create_folder", "target_path": campaign.campaign_folder_path, "reason": "campaign_folder"}]
+def planned_folder_items(
+    campaign: Campaign,
+    campaign_orgs: list[CampaignOrganization],
+    organizations: list[Organization] | None = None,
+) -> list[dict[str, Any]]:
+    org_by_id = {org.id: org for org in organizations or []}
+    items = [
+        {
+            "action": "create_folder",
+            "target_path": campaign.campaign_folder_path,
+            "reason": "campaign_folder",
+            "metadata_json": {"title": campaign.title},
+        }
+    ]
     for item in campaign_orgs:
+        org = org_by_id.get(item.organization_id)
+        desired_path = organization_folder_path(campaign.campaign_folder_path, (org.display_name or org.code) if org else item.folder_path)
+        metadata = {"campaign_org_id": item.id, "organization_id": item.organization_id}
+        if org:
+            metadata.update({"organization_code": org.code, "organization_name": org.display_name})
+        if item.folder_path != desired_path:
+            items.append(
+                {
+                    "action": "move",
+                    "source_path": item.folder_path,
+                    "target_path": desired_path,
+                    "reason": "organization_folder_rename",
+                    "metadata_json": metadata,
+                }
+            )
+            continue
         if item.status in {CampaignOrganizationStatus.folder_created, CampaignOrganizationStatus.link_created}:
             continue
-        items.append({"action": "create_folder", "target_path": item.folder_path, "reason": "organization_folder"})
+        items.append(
+            {
+                "action": "create_folder",
+                "target_path": item.folder_path,
+                "reason": "organization_folder",
+                "metadata_json": metadata,
+            }
+        )
     return items
 
 
@@ -401,12 +494,15 @@ def persist_scan_results(
     campaign: Campaign,
     classified,
     campaign_orgs: list[CampaignOrganization],
+    current_paths: dict[str, str] | None = None,
 ) -> None:
+    current_paths = current_paths or {}
     session.exec(delete(FileRecord).where(FileRecord.campaign_id == campaign.id))
     org_status = {item.organization_id: item for item in campaign_orgs}
     uploaded_org_ids: set[str] = set()
     rejected_org_ids: set[str] = set()
     for item in classified:
+        current_path = current_paths.get(item.candidate.path, item.candidate.path)
         if item.organization_id and item.classification == "valid":
             uploaded_org_ids.add(item.organization_id)
         elif item.organization_id:
@@ -416,9 +512,9 @@ def persist_scan_results(
                 campaign_id=campaign.id,
                 organization_id=item.organization_id,
                 original_path=item.candidate.path,
-                current_path=item.candidate.path,
+                current_path=current_path,
                 original_name=item.candidate.name,
-                current_name=item.normalized_name,
+                current_name=PurePosixPath(current_path).name,
                 extension=extension_of(item.normalized_name),
                 mime_type=item.candidate.mime_type,
                 size=item.candidate.size,

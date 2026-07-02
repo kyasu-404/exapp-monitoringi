@@ -54,11 +54,9 @@ ADD /ex_app/li[b] /ex_app/lib
 COPY --chmod=775 healthcheck.sh /
 COPY --chmod=775 start.sh /
 
-ENV MRM_STORAGE_DIR=/data \
-    PYTHONUNBUFFERED=1
+ENV PYTHONUNBUFFERED=1
 
 VOLUME ["/data"]
 WORKDIR /ex_app/lib
 ENTRYPOINT ["/start.sh", "python3", "main.py"]
 HEALTHCHECK --interval=5s --timeout=3s --retries=60 CMD /healthcheck.sh
-

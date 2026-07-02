@@ -28,6 +28,14 @@ MAILING_COLUMNS = [
     "Ошибка",
 ]
 
+LINK_COLUMNS = [
+    "Тип ОУ",
+    "Номер",
+    "Email",
+    "Папка Nextcloud",
+    "Ссылка для загрузки",
+]
+
 
 def render_template(template: str, values: dict[str, str | None]) -> str:
     result = template
@@ -61,6 +69,29 @@ def mailing_rows(
                 "Текст письма": item.mail_body or "",
                 "Статус": item.status.value if hasattr(item.status, "value") else str(item.status),
                 "Ошибка": "",
+            }
+        )
+    return rows
+
+
+def link_rows(
+    campaign: Campaign,
+    organizations: list[Organization],
+    campaign_orgs: list[CampaignOrganization],
+) -> list[dict[str, str]]:
+    org_by_id = {org.id: org for org in organizations}
+    rows: list[dict[str, str]] = []
+    for item in campaign_orgs:
+        org = org_by_id.get(item.organization_id)
+        if org is None:
+            continue
+        rows.append(
+            {
+                "Тип ОУ": org.type.value if hasattr(org.type, "value") else str(org.type),
+                "Номер": org.code,
+                "Email": org.email or "",
+                "Папка Nextcloud": item.folder_path,
+                "Ссылка для загрузки": item.public_link or "",
             }
         )
     return rows
@@ -103,7 +134,7 @@ def report_workbook(campaign: Campaign, files: list[FileRecord], missing: list[O
         key = item.classification.value if hasattr(item.classification, "value") else str(item.classification)
         counts[key] = counts.get(key, 0) + 1
     summary.append(["Показатель", "Значение"])
-    summary.append(["Кампания", campaign.title])
+    summary.append(["Мониторинг", campaign.title])
     summary.append(["Всего файлов", len(files)])
     summary.append(["Корректных файлов", counts.get("valid", 0)])
     summary.append(["Дублей", counts.get("duplicate", 0)])

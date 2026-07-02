@@ -11,10 +11,10 @@ from .models import OrganizationType
 
 
 class OrganizationIn(BaseModel):
-    type: OrganizationType = OrganizationType.other
+    type: OrganizationType = OrganizationType.school
     prefix: str | None = None
     code: str
-    display_name: str
+    display_name: str | None = None
     short_name: str | None = None
     email: EmailStr | None = None
     extra_emails: list[EmailStr] = Field(default_factory=list)
@@ -38,10 +38,15 @@ class OrganizationPatch(BaseModel):
     notes: str | None = None
 
 
+class OrganizationImportJsonIn(BaseModel):
+    filename: str
+    content_base64: str
+
+
 class CampaignIn(BaseModel):
     title: str
     description: str | None = None
-    date: Date
+    date: Date = Field(default_factory=Date.today)
     deadline: Date | None = None
     parent_nc_path: str = "/Мониторинги"
     selected_org_types: list[OrganizationType] = Field(default_factory=list)
@@ -82,12 +87,11 @@ class BulkPathsIn(BaseModel):
     paths: list[str] = Field(default_factory=list)
     campaign_id: str | None = None
     batch_id: str | None = None
+    name_template: str | None = None
 
 
 class SettingsIn(BaseModel):
     nc_base_url: str | None = None
-    nc_user: str | None = None
-    nc_app_password: str | None = None
     root_path: str | None = None
     duplicates_folder: str | None = None
     invalid_folder: str | None = None

@@ -191,6 +191,12 @@ def organization_sort_key(org: OrganizationLike | dict[str, Any]) -> tuple[str, 
     )
 
 
+def mtime_sort_value(value: datetime | None) -> float:
+    if value is None:
+        return 0.0
+    return value.timestamp()
+
+
 def classify_files(
     files: Iterable[FileCandidate],
     organizations: Iterable[OrganizationLike | dict[str, Any]],
@@ -226,9 +232,7 @@ def classify_files(
         if current is None:
             newest_by_name[key] = item
             continue
-        current_mtime = current.candidate.mtime or datetime.min
-        item_mtime = item.candidate.mtime or datetime.min
-        if item_mtime > current_mtime:
+        if mtime_sort_value(item.candidate.mtime) > mtime_sort_value(current.candidate.mtime):
             newest_by_name[key] = item
 
     result: list[ClassifiedFile] = []

@@ -8,7 +8,7 @@ Nextcloud ExApp для управления сборами файлов от о�
 - Docker image contract для Deploy Daemon типа HaRP Proxy (Docker).
 - FastAPI backend с lifecycle, AppAPI middleware, SQLite-хранилищем и статическим UI.
 - Справочник организаций, импорт/экспорт CSV/XLSX, кампании, выбор организаций.
-- WebDAV-клиент для `PROPFIND`, `MKCOL`, `MOVE`, `COPY`, `DELETE`, `PUT`.
+- WebDAV-клиент для `PROPFIND`, `MKCOL`, `MOVE`, `COPY`, `DELETE`, `PUT` через AppAPI-аутентификацию текущего пользователя.
 - OCS Share API клиент для публичных upload-ссылок.
 - Preview/apply для создания папок, переименований и перемещений.
 - Проверка файлов кампании, нормализация имён, точное сопоставление кодов, дубли.
@@ -45,9 +45,6 @@ Nextcloud ExApp для управления сборами файлов от о�
 
 ## Переменные окружения
 
-- `MRM_NC_BASE_URL`: внутренний URL Nextcloud, например `http://nextcloud`.
-- `MRM_NC_USER`: технический пользователь WebDAV/OCS.
-- `MRM_NC_APP_PASSWORD`: app password технического пользователя.
 - `MRM_ROOT_PATH`: корневая папка мониторингов, по умолчанию `/Мониторинги`.
 - `MRM_DATABASE_URL`: SQLAlchemy URL, по умолчанию SQLite в volume `/data`.
 - `MRM_DUPLICATES_FOLDER`: папка дублей, по умолчанию `_Дубли`.
@@ -62,4 +59,3 @@ pytest
 ```
 
 В этом рабочем окружении полноценный запуск ExApp не проверяется, потому что нет Nextcloud/AppAPI/HaRP сервера.
-

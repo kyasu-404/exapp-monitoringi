@@ -67,10 +67,9 @@ def join_nc_path(*parts: str) -> str:
 
 
 def campaign_folder_path(parent: str, campaign_date: date, title: str) -> str:
-    folder_name = clean_path_segment(f"{campaign_date.isoformat()} {title}")
+    folder_name = clean_path_segment(title)
     return join_nc_path(parent, folder_name)
 
 
 def organization_folder_path(campaign_path: str, organization_display_name: str) -> str:
     return join_nc_path(campaign_path, clean_path_segment(organization_display_name))
-
