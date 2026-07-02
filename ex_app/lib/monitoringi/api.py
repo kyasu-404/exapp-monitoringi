@@ -35,6 +35,7 @@ from .reports import LINK_COLUMNS, MAILING_COLUMNS, csv_bytes, link_rows, mailin
 from .schemas import (
     BulkPathsIn,
     CampaignIn,
+    CampaignMoveIn,
     CampaignPatch,
     OrganizationImportJsonIn,
     OrganizationIn,
@@ -53,6 +54,7 @@ from .services import (
     create_batch,
     create_campaign_orgs,
     current_user_id,
+    deadline_storage,
     entries_to_candidates,
     mail_values_for_campaign_org,
     missing_by_type,
@@ -133,13 +135,101 @@ async def _prune_missing_campaigns(session: Session, request: Request, campaigns
                 except AppError as exc:
                     if exc.code != "WEBDAV_PATH_NOT_FOUND":
                         raise
-                    _delete_campaign_record(session, campaign, user_id=_user(request), reason="webdav_path_not_found")
-                    changed = True
+                    old_path = campaign.campaign_folder_path
+                    moved_path = await _find_moved_campaign_folder(client, session, campaign)
+                    if moved_path:
+                        _rewrite_campaign_paths(session, campaign, old_path, moved_path)
+                        audit(
+                            session,
+                            user_id=_user(request),
+                            action="relink_moved_folder",
+                            entity_type="campaign",
+                            entity_id=campaign.id,
+                            before={"campaign_folder_path": old_path},
+                            after={"campaign_folder_path": moved_path},
+                        )
+                        changed = True
+                    kept.append(campaign)
     except AppError:
         raise
     if changed:
         session.commit()
     return kept
+
+
+def _rewrite_campaign_paths(session: Session, campaign: Campaign, old_folder: str, new_folder: str) -> None:
+    old_root = old_folder.rstrip("/")
+    new_root = new_folder.rstrip("/")
+    campaign.campaign_folder_path = new_folder
+    parent = str(PurePosixPath(new_folder).parent)
+    campaign.parent_nc_path = "/" if parent == "." else parent
+    campaign.updated_at = utcnow()
+    session.add(campaign)
+    for item in session.exec(select(CampaignOrganization).where(CampaignOrganization.campaign_id == campaign.id)).all():
+        if item.folder_path == old_root or item.folder_path.startswith(old_root + "/"):
+            item.folder_path = new_root + item.folder_path[len(old_root) :]
+            item.updated_at = utcnow()
+            session.add(item)
+    for file_record in session.exec(select(FileRecord).where(FileRecord.campaign_id == campaign.id)).all():
+        for attr in ("original_path", "current_path"):
+            value = getattr(file_record, attr)
+            if value == old_root or value.startswith(old_root + "/"):
+                setattr(file_record, attr, new_root + value[len(old_root) :])
+        file_record.updated_at = utcnow()
+        session.add(file_record)
+
+
+async def _campaign_folder_exists(client: NextcloudClient, path: str) -> bool:
+    try:
+        entries = await client.propfind(path, depth=0)
+    except AppError as exc:
+        if exc.code == "WEBDAV_PATH_NOT_FOUND":
+            return False
+        raise
+    return bool(entries and entries[0].is_collection)
+
+
+async def _find_moved_campaign_folder(client: NextcloudClient, session: Session, campaign: Campaign) -> str | None:
+    folder_name = PurePosixPath(campaign.campaign_folder_path).name or clean_path_segment(campaign.title)
+    settings = settings_map(session, include_secret=True)
+    roots = [
+        campaign.parent_nc_path,
+        settings.get("root_path") or "",
+        "/Мониторинги",
+        "/",
+    ]
+    direct_candidates = []
+    for root in roots:
+        if root:
+            direct_candidates.append(join_nc_path(root, folder_name))
+    direct_candidates.append(campaign_folder_path(settings.get("root_path") or campaign.parent_nc_path, campaign.date, campaign.title))
+    seen: set[str] = set()
+    for candidate in direct_candidates:
+        if candidate in seen or candidate == campaign.campaign_folder_path:
+            continue
+        seen.add(candidate)
+        if await _campaign_folder_exists(client, candidate):
+            return candidate
+
+    folders_to_scan: list[tuple[str, int]] = [(root, 0) for root in roots if root]
+    while folders_to_scan:
+        root, depth = folders_to_scan.pop(0)
+        if root in seen or depth > 2:
+            continue
+        seen.add(root)
+        try:
+            entries = await client.propfind(root, depth=1)
+        except AppError as exc:
+            if exc.code == "WEBDAV_PATH_NOT_FOUND":
+                continue
+            raise
+        for entry in entries:
+            if not entry.is_collection or entry.path == root:
+                continue
+            if entry.name == folder_name:
+                return entry.path
+            folders_to_scan.append((entry.path, depth + 1))
+    return None
 
 
 def _organization_create_data(payload: OrganizationIn) -> dict[str, Any]:
@@ -203,12 +293,17 @@ def _get_batch(session: Session, batch_id: str) -> OperationBatch:
     return batch
 
 
+def _organizations_selected_for_campaign(session: Session, campaign: Campaign) -> list[Organization]:
+    query = select(Organization).where(Organization.active == True)  # noqa: E712
+    if campaign.selected_org_types:
+        query = query.where(Organization.type.in_(campaign.selected_org_types))
+    return session.exec(query).all()
+
+
 def _campaign_orgs(session: Session, campaign: Campaign) -> list[CampaignOrganization]:
     items = session.exec(select(CampaignOrganization).where(CampaignOrganization.campaign_id == campaign.id)).all()
-    if campaign.selected_org_types:
-        organizations = session.exec(
-            select(Organization).where(Organization.active == True, Organization.type.in_(campaign.selected_org_types))  # noqa: E712
-        ).all()
+    organizations = _organizations_selected_for_campaign(session, campaign)
+    if organizations:
         return sync_campaign_orgs(session, campaign, organizations) if items else create_campaign_orgs(session, campaign, organizations)
     if items:
         return items
@@ -266,7 +361,11 @@ async def _ensure_campaign_org_folders_exist(
         )
     try:
         async with NextcloudClient(_nc_credentials(session, request)) as client:
-            entries = await client.propfind(campaign.campaign_folder_path, depth=1)
+            await client.propfind(campaign.campaign_folder_path, depth=0)
+            missing = []
+            for item in campaign_orgs:
+                if not await _webdav_folder_exists(client, item.folder_path):
+                    missing.append(item.folder_path)
     except AppError as exc:
         if exc.code == "WEBDAV_PATH_NOT_FOUND":
             raise HTTPException(
@@ -274,17 +373,6 @@ async def _ensure_campaign_org_folders_exist(
                 detail={"code": "CAMPAIGN_FOLDER_NOT_FOUND", "message": "Папка мониторинга не найдена в Nextcloud."},
             ) from exc
         _raise(exc)
-
-    campaign_depth = len(path_parts(campaign.campaign_folder_path))
-    available_folders = {
-        entry.path.rstrip("/")
-        for entry in entries
-        if entry.is_collection
-        and entry.path.rstrip("/") != campaign.campaign_folder_path.rstrip("/")
-        and len(path_parts(entry.path)) == campaign_depth + 1
-        and path_parts(entry.path)[-1] not in CLEANUP_FOLDERS
-    }
-    missing = [item.folder_path for item in campaign_orgs if item.folder_path.rstrip("/") not in available_folders]
     if missing:
         sample = ", ".join(PurePosixPath(path).name for path in missing[:5])
         tail = f" и ещё {len(missing) - 5}" if len(missing) > 5 else ""
@@ -620,7 +708,7 @@ async def create_campaign(payload: CampaignIn, session: SessionDep, request: Req
         title=payload.title,
         description=payload.description,
         date=payload.date,
-        deadline=payload.deadline,
+        deadline=deadline_storage(payload.deadline),
         parent_nc_path=parent,
         campaign_folder_path=folder,
         selected_org_types=[item.value for item in payload.selected_org_types],
@@ -641,6 +729,44 @@ def get_campaign(campaign_id: str, session: SessionDep) -> dict[str, Any]:
     return _model_json(campaign)
 
 
+def _campaign_move_target(campaign: Campaign, target_nc_path: str, root_path: str) -> str:
+    target = ensure_under_root(target_nc_path, root_path)
+    current_name = PurePosixPath(campaign.campaign_folder_path).name
+    if PurePosixPath(target).name == current_name:
+        return target
+    return campaign_folder_path(target, campaign.date, campaign.title)
+
+
+async def _move_or_relink_campaign_folder(
+    session: Session,
+    request: Request,
+    campaign: Campaign,
+    new_folder: str,
+) -> None:
+    old_folder = campaign.campaign_folder_path
+    if new_folder == old_folder:
+        return
+    try:
+        async with NextcloudClient(_nc_credentials(session, request)) as client:
+            old_exists = await _campaign_folder_exists(client, old_folder)
+            new_exists = await _campaign_folder_exists(client, new_folder)
+            if old_exists and new_exists:
+                raise HTTPException(
+                    status_code=409,
+                    detail={"code": "CAMPAIGN_TARGET_EXISTS", "message": "Целевая папка мониторинга уже существует."},
+                )
+            if old_exists:
+                await client.move(old_folder, new_folder)
+            elif not new_exists:
+                raise HTTPException(
+                    status_code=404,
+                    detail={"code": "CAMPAIGN_FOLDER_NOT_FOUND", "message": "Не найдена ни старая, ни новая папка мониторинга."},
+                )
+    except AppError as exc:
+        _raise(exc)
+    _rewrite_campaign_paths(session, campaign, old_folder, new_folder)
+
+
 @router.put("/campaigns/{campaign_id}")
 async def update_campaign(campaign_id: str, payload: CampaignPatch, session: SessionDep, request: Request) -> dict[str, Any]:
     campaign = _get_campaign(session, campaign_id)
@@ -659,30 +785,17 @@ async def update_campaign(campaign_id: str, payload: CampaignPatch, session: Ses
         data["selected_org_types"] = [str(item.value if hasattr(item, "value") else item) for item in data["selected_org_types"]]
     if "allowed_extensions" in data and data["allowed_extensions"] is not None:
         data["allowed_extensions"] = [str(item).lower().lstrip(".") for item in data["allowed_extensions"]]
+    if "deadline" in data:
+        data["deadline"] = deadline_storage(data["deadline"])
     new_folder = data.get("campaign_folder_path", old_folder)
     if new_folder != old_folder:
-        try:
-            async with NextcloudClient(_nc_credentials(session, request)) as client:
-                await client.move(old_folder, new_folder)
-        except AppError as exc:
-            _raise(exc)
+        await _move_or_relink_campaign_folder(session, request, campaign, new_folder)
     for key, value in data.items():
+        if key in {"parent_nc_path", "campaign_folder_path"} and new_folder != old_folder:
+            continue
         setattr(campaign, key, value)
     campaign.updated_at = utcnow()
     session.add(campaign)
-    if new_folder != old_folder:
-        for item in session.exec(select(CampaignOrganization).where(CampaignOrganization.campaign_id == campaign.id)).all():
-            if item.folder_path.startswith(old_folder.rstrip("/") + "/"):
-                item.folder_path = new_folder.rstrip("/") + item.folder_path[len(old_folder.rstrip("/")) :]
-                item.updated_at = utcnow()
-                session.add(item)
-        for file_record in session.exec(select(FileRecord).where(FileRecord.campaign_id == campaign.id)).all():
-            for attr in ("original_path", "current_path"):
-                value = getattr(file_record, attr)
-                if value.startswith(old_folder.rstrip("/") + "/"):
-                    setattr(file_record, attr, new_folder.rstrip("/") + value[len(old_folder.rstrip("/")) :])
-            file_record.updated_at = utcnow()
-            session.add(file_record)
     if "selected_org_types" in data:
         session.exec(delete(CampaignOrganization).where(CampaignOrganization.campaign_id == campaign.id))
         if campaign.selected_org_types:
@@ -691,6 +804,20 @@ async def update_campaign(campaign_id: str, payload: CampaignPatch, session: Ses
             ).all()
             create_campaign_orgs(session, campaign, organizations)
     audit(session, user_id=_user(request), action="update", entity_type="campaign", entity_id=campaign.id, before=before, after=_model_json(campaign))
+    session.commit()
+    session.refresh(campaign)
+    return _model_json(campaign)
+
+
+@router.post("/campaigns/{campaign_id}/move")
+async def move_campaign(campaign_id: str, payload: CampaignMoveIn, session: SessionDep, request: Request) -> dict[str, Any]:
+    campaign = _get_campaign(session, campaign_id)
+    before = _model_json(campaign)
+    root_path = settings_map(session, include_secret=True).get("root_path") or campaign.parent_nc_path
+    new_folder = _campaign_move_target(campaign, payload.target_nc_path, root_path)
+    ensure_under_root(new_folder, root_path)
+    await _move_or_relink_campaign_folder(session, request, campaign, new_folder)
+    audit(session, user_id=_user(request), action="move", entity_type="campaign", entity_id=campaign.id, before=before, after=_model_json(campaign))
     session.commit()
     session.refresh(campaign)
     return _model_json(campaign)
@@ -761,6 +888,8 @@ async def create_folders_apply(
         session.commit()
         success = 0
         failed = 0
+        org_by_id = {org.id: org for org in _organizations_for_campaign(session, campaign)}
+        mail_template = _default_mail_template(session)
         try:
             async with NextcloudClient(_nc_credentials(session, request)) as client:
                 items = session.exec(select(OperationItem).where(OperationItem.batch_id == batch.id)).all()
@@ -799,9 +928,22 @@ async def create_folders_apply(
                     if item.status == OperationItemStatus.success and item.metadata_json.get("campaign_org_id"):
                         campaign_org = session.get(CampaignOrganization, item.metadata_json["campaign_org_id"])
                         if campaign_org is not None:
+                            old_folder_path = campaign_org.folder_path
                             campaign_org.folder_path = item.target_path or campaign_org.folder_path
                             if campaign_org.status == CampaignOrganizationStatus.pending:
                                 campaign_org.status = CampaignOrganizationStatus.folder_created
+                            if campaign_org.public_link and campaign_org.folder_path != old_folder_path:
+                                org = org_by_id.get(campaign_org.organization_id)
+                                if org:
+                                    subject, body = mail_values_for_campaign_org(
+                                        campaign,
+                                        org,
+                                        campaign_org,
+                                        mail_template.subject_template,
+                                        mail_template.body_template,
+                                    )
+                                    campaign_org.mail_subject = subject
+                                    campaign_org.mail_body = body
                             campaign_org.updated_at = utcnow()
                             session.add(campaign_org)
                     session.commit()
@@ -846,9 +988,13 @@ async def create_shares_preview(campaign_id: str, session: SessionDep, request: 
             "metadata_json": {"campaign_org_id": item.id},
         }
         for item in campaign_orgs
-        if not item.public_link
+        if not item.public_link or not item.mail_subject or not item.mail_body
     ]
-    summary = {"shares_to_create": len(items), "existing_links": len(campaign_orgs) - len(items)}
+    summary = {
+        "shares_to_create": len([item for item in campaign_orgs if not item.public_link]),
+        "mailing_to_refresh": len([item for item in campaign_orgs if item.public_link and (not item.mail_subject or not item.mail_body)]),
+        "existing_links": len([item for item in campaign_orgs if item.public_link]),
+    }
     batch = create_batch(session, operation_type="create_shares", campaign_id=campaign.id, user_id=_user(request), items=items, summary=summary)
     return batch_payload(session, batch)
 
@@ -888,17 +1034,20 @@ async def create_shares_apply(
                     session.add(item)
                     continue
                 try:
-                    share = await client.create_public_share(
-                        campaign_org.folder_path,
-                        public_upload=options.public_upload,
-                        expire_date=options.expire_date or campaign.deadline,
-                        password=options.password,
-                        permissions=options.permissions,
-                        label=campaign.title,
-                        note=f"{campaign_org.folder_path} · {campaign.title}",
-                    )
-                    campaign_org.share_id = str(share.get("share_id") or "")
-                    campaign_org.public_link = str(share.get("public_link") or "")
+                    if campaign_org.public_link:
+                        share = {"share_id": campaign_org.share_id, "public_link": campaign_org.public_link}
+                    else:
+                        share = await client.create_public_share(
+                            campaign_org.folder_path,
+                            public_upload=options.public_upload,
+                            expire_date=options.expire_date or campaign.deadline,
+                            password=options.password,
+                            permissions=options.permissions,
+                            label=campaign.title,
+                            note=f"{campaign_org.folder_path} · {campaign.title}",
+                        )
+                        campaign_org.share_id = str(share.get("share_id") or "")
+                        campaign_org.public_link = str(share.get("public_link") or "")
                     campaign_org.status = CampaignOrganizationStatus.link_created
                     org = org_by_id.get(campaign_org.organization_id)
                     if org:
@@ -987,11 +1136,21 @@ async def _scan_campaign(session: Session, campaign: Campaign, request: Request,
     ensure_under_root(scan_path, root)
     organizations = _organizations_for_campaign(session, campaign)
     async with NextcloudClient(_nc_credentials(session, request)) as client:
-        root_entries = await client.propfind(scan_path, depth=1)
-        entries = [entry for entry in root_entries if not _is_cleanup_path(campaign, entry.path)]
-        for entry in root_entries:
-            if entry.is_collection and entry.path != scan_path and not _is_cleanup_path(campaign, entry.path):
-                entries.extend([child for child in await client.propfind(entry.path, depth=1) if not _is_cleanup_path(campaign, child.path)])
+        entries = []
+        seen_paths: set[str] = set()
+        folders_to_scan: list[tuple[str, int]] = [(scan_path, 0)]
+        while folders_to_scan:
+            folder_path, depth = folders_to_scan.pop(0)
+            if folder_path in seen_paths:
+                continue
+            seen_paths.add(folder_path)
+            folder_entries = [entry for entry in await client.propfind(folder_path, depth=1) if not _is_cleanup_path(campaign, entry.path)]
+            entries.extend(folder_entries)
+            if depth >= 3:
+                continue
+            for entry in folder_entries:
+                if entry.is_collection and entry.path != folder_path:
+                    folders_to_scan.append((entry.path, depth + 1))
     candidates = entries_to_candidates(entries, skip_root=scan_path)
     return classify_files(candidates, organizations, allowed_extensions)
 

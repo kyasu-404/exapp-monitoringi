@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import csv
-from datetime import datetime
+from datetime import date, datetime, time
 from io import BytesIO, StringIO
 from pathlib import PurePosixPath
 from typing import Any
@@ -54,6 +54,7 @@ ORGANIZATION_TYPE_LABELS = {
     "odo": "ОДО",
     "udod": "УДОДы",
 }
+ORGANIZATION_TYPE_ORDER = ("school", "kindergarten", "odo", "udod", "other")
 
 ORGANIZATION_TYPE_ALIASES = {
     "school": "school",
@@ -83,6 +84,26 @@ def normalize_organization_type(value: Any) -> str:
 def organization_type_label(value: Any) -> str:
     normalized = normalize_organization_type(value)
     return ORGANIZATION_TYPE_LABELS.get(normalized, str(value or ""))
+
+
+def organization_type_value(organization: Organization) -> str:
+    return organization.type.value if hasattr(organization.type, "value") else str(organization.type)
+
+
+def campaign_type_values(campaign: Campaign, organizations: list[Organization] | None = None) -> list[str]:
+    selected = [
+        str(item.value if hasattr(item, "value") else item)
+        for item in (campaign.selected_org_types or [])
+        if str(item.value if hasattr(item, "value") else item)
+    ]
+    if selected:
+        return list(dict.fromkeys(selected))
+    values = {organization_type_value(org) for org in organizations or []}
+    return sorted(values, key=lambda item: ORGANIZATION_TYPE_ORDER.index(item) if item in ORGANIZATION_TYPE_ORDER else len(ORGANIZATION_TYPE_ORDER))
+
+
+def campaign_uses_type_folders(campaign: Campaign, organizations: list[Organization] | None = None) -> bool:
+    return len(campaign_type_values(campaign, organizations)) > 1
 
 
 def current_user_id(headers: dict[str, str]) -> str | None:
@@ -152,17 +173,46 @@ def nextcloud_overrides(session: Session, user_id: str | None = None) -> dict[st
     }
 
 
+def parse_deadline(value: date | datetime | str | None) -> datetime | None:
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        return value
+    if isinstance(value, date):
+        return datetime.combine(value, time(23, 59))
+    text = str(value).strip()
+    if not text:
+        return None
+    if len(text) == 10:
+        return datetime.combine(datetime.fromisoformat(text).date(), time(23, 59))
+    return datetime.fromisoformat(text.replace("Z", "+00:00")).replace(tzinfo=None)
+
+
+def deadline_storage(value: date | datetime | str | None) -> str | None:
+    parsed = parse_deadline(value)
+    return parsed.isoformat(timespec="minutes") if parsed else None
+
+
+def deadline_text(value: date | datetime | str | None) -> str:
+    parsed = parse_deadline(value)
+    return parsed.strftime("%Y-%m-%d %H:%M") if parsed else ""
+
+
 def default_template_values(
     campaign: Campaign,
     organization: Organization,
     campaign_org: CampaignOrganization,
 ) -> dict[str, str | None]:
+    org_type = organization_type_value(organization)
+    org_type_label = organization_type_label(org_type)
     return {
         "campaign_title": campaign.title,
         "campaign_date": campaign.date.isoformat(),
-        "deadline": campaign.deadline.isoformat() if campaign.deadline else "",
+        "deadline": deadline_text(campaign.deadline),
         "organization_name": organization.display_name,
-        "organization_type": organization.type.value if hasattr(organization.type, "value") else str(organization.type),
+        "organization_type": org_type,
+        "organization_type_label": org_type_label,
+        "organization_type_folder": org_type_label,
         "organization_code": organization.code,
         "public_link": campaign_org.public_link,
         "folder_path": campaign_org.folder_path,
@@ -288,14 +338,25 @@ def apply_organization_import(session: Session, rows: list[dict[str, Any]]) -> d
     return {"created": created, "updated": updated}
 
 
+def organization_folder_name(organization: Organization) -> str:
+    return organization.code or organization.display_name
+
+
+def campaign_organization_folder_path(campaign: Campaign, organization: Organization, *, use_type_folder: bool) -> str:
+    if use_type_folder:
+        return join_nc_path(campaign.campaign_folder_path, organization_type_label(organization_type_value(organization)), organization_folder_name(organization))
+    return organization_folder_path(campaign.campaign_folder_path, organization_folder_name(organization))
+
+
 def create_campaign_orgs(session: Session, campaign: Campaign, organizations: list[Organization]) -> list[CampaignOrganization]:
     existing = {
         item.organization_id: item
         for item in session.exec(select(CampaignOrganization).where(CampaignOrganization.campaign_id == campaign.id)).all()
     }
     result: list[CampaignOrganization] = []
+    use_type_folder = campaign_uses_type_folders(campaign, organizations)
     for org in organizations:
-        folder_path = organization_folder_path(campaign.campaign_folder_path, org.display_name)
+        folder_path = campaign_organization_folder_path(campaign, org, use_type_folder=use_type_folder)
         item = existing.get(org.id)
         if item is None:
             item = CampaignOrganization(campaign_id=campaign.id, organization_id=org.id, folder_path=folder_path)
@@ -314,13 +375,14 @@ def sync_campaign_orgs(session: Session, campaign: Campaign, organizations: list
         for item in session.exec(select(CampaignOrganization).where(CampaignOrganization.campaign_id == campaign.id)).all()
     }
     changed = False
+    use_type_folder = campaign_uses_type_folders(campaign, organizations)
     for org in organizations:
         if org.id in existing:
             continue
         item = CampaignOrganization(
             campaign_id=campaign.id,
             organization_id=org.id,
-            folder_path=organization_folder_path(campaign.campaign_folder_path, org.display_name or org.code),
+            folder_path=campaign_organization_folder_path(campaign, org, use_type_folder=use_type_folder),
         )
         session.add(item)
         existing[org.id] = item
@@ -424,21 +486,43 @@ def planned_folder_items(
     organizations: list[Organization] | None = None,
 ) -> list[dict[str, Any]]:
     org_by_id = {org.id: org for org in organizations or []}
-    items = [
-        {
-            "action": "create_folder",
-            "target_path": campaign.campaign_folder_path,
-            "reason": "campaign_folder",
-            "metadata_json": {"title": campaign.title},
-        }
-    ]
+    items: list[dict[str, Any]] = []
+    use_type_folder = campaign_uses_type_folders(campaign, organizations)
+    if use_type_folder:
+        for type_value in campaign_type_values(campaign, organizations):
+            type_folder = organization_type_label(type_value)
+            items.append(
+                {
+                    "action": "create_folder",
+                    "target_path": join_nc_path(campaign.campaign_folder_path, type_folder),
+                    "reason": "organization_type_folder",
+                    "metadata_json": {"organization_type": type_value, "organization_type_folder": type_folder},
+                }
+            )
     for item in campaign_orgs:
         org = org_by_id.get(item.organization_id)
-        desired_path = organization_folder_path(campaign.campaign_folder_path, (org.display_name or org.code) if org else item.folder_path)
+        desired_path = campaign_organization_folder_path(campaign, org, use_type_folder=use_type_folder) if org else item.folder_path
         metadata = {"campaign_org_id": item.id, "organization_id": item.organization_id}
         if org:
-            metadata.update({"organization_code": org.code, "organization_name": org.display_name})
+            metadata.update(
+                {
+                    "organization_code": org.code,
+                    "organization_name": org.display_name,
+                    "organization_type": organization_type_value(org),
+                    "organization_type_folder": organization_type_label(organization_type_value(org)),
+                }
+            )
         if item.folder_path != desired_path:
+            if item.status == CampaignOrganizationStatus.pending:
+                items.append(
+                    {
+                        "action": "create_folder",
+                        "target_path": desired_path,
+                        "reason": "organization_folder",
+                        "metadata_json": metadata,
+                    }
+                )
+                continue
             items.append(
                 {
                     "action": "move",

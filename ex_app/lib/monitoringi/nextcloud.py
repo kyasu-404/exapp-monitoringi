@@ -240,7 +240,7 @@ class NextcloudClient:
         path: str,
         *,
         public_upload: bool = True,
-        expire_date: date | None = None,
+        expire_date: date | datetime | str | None = None,
         password: str | None = None,
         permissions: int = 4,
         label: str | None = None,
@@ -254,7 +254,12 @@ class NextcloudClient:
             "publicUpload": "true" if public_upload else "false",
         }
         if expire_date:
-            form["expireDate"] = expire_date.isoformat()
+            if isinstance(expire_date, datetime):
+                form["expireDate"] = expire_date.date().isoformat()
+            elif isinstance(expire_date, date):
+                form["expireDate"] = expire_date.isoformat()
+            else:
+                form["expireDate"] = str(expire_date).replace(" ", "T").split("T", 1)[0]
         if password:
             form["password"] = password
         if label:

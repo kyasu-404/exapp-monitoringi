@@ -210,6 +210,18 @@
   color: var(--mrm-primary-text);
 }
 
+.mrm-list-tools {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 14px;
+  flex-wrap: wrap;
+}
+
+.mrm-list-tools .mrm-hint {
+  margin: 0;
+}
+
 .mrm-grid {
   display: grid;
   grid-template-columns: repeat(12, minmax(0, 1fr));

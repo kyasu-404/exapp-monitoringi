@@ -107,7 +107,7 @@ class Campaign(SQLModel, table=True):
     title: str = Field(index=True)
     description: str | None = None
     date: date
-    deadline: date | None = None
+    deadline: str | None = None
     parent_nc_path: str
     campaign_folder_path: str
     selected_org_types: list[str] = Field(default_factory=list, sa_column=Column(SAJSON))
@@ -206,4 +206,3 @@ class SettingsEntry(SQLModel, table=True):
     key: str = Field(primary_key=True)
     value_json: Any = Field(default=None, sa_column=Column(SAJSON))
     updated_at: datetime = Field(default_factory=utcnow)
-

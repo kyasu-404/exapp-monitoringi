@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import csv
+from datetime import date, datetime, time
 from io import BytesIO, StringIO
 from typing import Iterable
 
@@ -12,9 +13,17 @@ from openpyxl.styles import Font, PatternFill
 from .algorithms import organization_sort_key
 from .models import Campaign, CampaignOrganization, FileRecord, Organization
 
+ORGANIZATION_TYPE_LABELS = {
+    "school": "Школы",
+    "kindergarten": "Сады",
+    "odo": "ОДО",
+    "udod": "УДОДы",
+}
+ORGANIZATION_TYPE_ORDER = ("school", "kindergarten", "odo", "udod", "other")
 
 MAILING_COLUMNS = [
     "Тип организации",
+    "Раздел ОУ",
     "Код",
     "Название организации",
     "Email",
@@ -30,6 +39,7 @@ MAILING_COLUMNS = [
 
 LINK_COLUMNS = [
     "Тип ОУ",
+    "Раздел ОУ",
     "Номер",
     "Email",
     "Папка Nextcloud",
@@ -44,6 +54,43 @@ def render_template(template: str, values: dict[str, str | None]) -> str:
     return result
 
 
+def _organization_type_value(organization: Organization) -> str:
+    return organization.type.value if hasattr(organization.type, "value") else str(organization.type)
+
+
+def _organization_type_label(value: str) -> str:
+    return ORGANIZATION_TYPE_LABELS.get(value, value)
+
+
+def _parse_deadline(value: date | datetime | str | None) -> datetime | None:
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        return value
+    if isinstance(value, date):
+        return datetime.combine(value, time(23, 59))
+    text = str(value).strip()
+    if not text:
+        return None
+    if len(text) == 10:
+        return datetime.combine(datetime.fromisoformat(text).date(), time(23, 59))
+    return datetime.fromisoformat(text.replace("Z", "+00:00")).replace(tzinfo=None)
+
+
+def _deadline_text(value: date | datetime | str | None) -> str:
+    parsed = _parse_deadline(value)
+    return parsed.strftime("%Y-%m-%d %H:%M") if parsed else ""
+
+
+def _campaign_org_sort_key(item: CampaignOrganization, org_by_id: dict[str, Organization]) -> tuple[int, str, tuple]:
+    org = org_by_id.get(item.organization_id)
+    if org is None:
+        return (len(ORGANIZATION_TYPE_ORDER), "", (1, ""))
+    org_type = _organization_type_value(org)
+    type_order = ORGANIZATION_TYPE_ORDER.index(org_type) if org_type in ORGANIZATION_TYPE_ORDER else len(ORGANIZATION_TYPE_ORDER)
+    return (type_order, _organization_type_label(org_type), organization_sort_key(org))
+
+
 def mailing_rows(
     campaign: Campaign,
     organizations: list[Organization],
@@ -51,20 +98,23 @@ def mailing_rows(
 ) -> list[dict[str, str]]:
     org_by_id = {org.id: org for org in organizations}
     rows: list[dict[str, str]] = []
-    for item in campaign_orgs:
+    for item in sorted(campaign_orgs, key=lambda row: _campaign_org_sort_key(row, org_by_id)):
         org = org_by_id.get(item.organization_id)
         if org is None:
             continue
+        org_type = _organization_type_value(org)
+        org_type_label = _organization_type_label(org_type)
         rows.append(
             {
-                "Тип организации": org.type.value if hasattr(org.type, "value") else str(org.type),
+                "Тип организации": org_type_label,
+                "Раздел ОУ": org_type_label,
                 "Код": org.code,
                 "Название организации": org.display_name,
                 "Email": org.email or "",
                 "Дополнительные email": ", ".join(org.extra_emails or []),
                 "Папка Nextcloud": item.folder_path,
                 "Публичная ссылка": item.public_link or "",
-                "Срок сдачи": campaign.deadline.isoformat() if campaign.deadline else "",
+                "Срок сдачи": _deadline_text(campaign.deadline),
                 "Тема письма": item.mail_subject or "",
                 "Текст письма": item.mail_body or "",
                 "Статус": item.status.value if hasattr(item.status, "value") else str(item.status),
@@ -81,13 +131,16 @@ def link_rows(
 ) -> list[dict[str, str]]:
     org_by_id = {org.id: org for org in organizations}
     rows: list[dict[str, str]] = []
-    for item in campaign_orgs:
+    for item in sorted(campaign_orgs, key=lambda row: _campaign_org_sort_key(row, org_by_id)):
         org = org_by_id.get(item.organization_id)
         if org is None:
             continue
+        org_type = _organization_type_value(org)
+        org_type_label = _organization_type_label(org_type)
         rows.append(
             {
-                "Тип ОУ": org.type.value if hasattr(org.type, "value") else str(org.type),
+                "Тип ОУ": org_type_label,
+                "Раздел ОУ": org_type_label,
                 "Номер": org.code,
                 "Email": org.email or "",
                 "Папка Nextcloud": item.folder_path,
@@ -146,7 +199,7 @@ def report_workbook(campaign: Campaign, files: list[FileRecord], missing: list[O
     missing_sheet = wb.create_sheet("Не предоставили")
     missing_sheet.append(["Тип", "Код", "Организация", "Email"])
     for org in sorted(missing, key=organization_sort_key):
-        missing_sheet.append([org.type.value, org.code, org.display_name, org.email or ""])
+        missing_sheet.append([_organization_type_label(_organization_type_value(org)), org.code, org.display_name, org.email or ""])
     _append_files_sheet(wb, "Дубли", [item for item in files if str(item.classification).endswith("duplicate") or item.classification == "duplicate"])
     _append_files_sheet(
         wb,

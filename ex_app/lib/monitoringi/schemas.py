@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 from datetime import date as Date
+from datetime import datetime as DateTime
+from datetime import time as Time
 from typing import Any
 
-from pydantic import BaseModel, EmailStr, Field
+from pydantic import BaseModel, EmailStr, Field, field_validator
 
 from .models import OrganizationType
 
@@ -47,23 +49,37 @@ class CampaignIn(BaseModel):
     title: str
     description: str | None = None
     date: Date = Field(default_factory=Date.today)
-    deadline: Date | None = None
+    deadline: DateTime | None = None
     parent_nc_path: str = "/Мониторинги"
     selected_org_types: list[OrganizationType] = Field(default_factory=list)
     allowed_extensions: list[str] = Field(default_factory=lambda: ["pdf", "docx", "xlsx"])
     allowed_mime_types: list[str] = Field(default_factory=list)
+
+    @field_validator("deadline", mode="before")
+    @classmethod
+    def normalize_deadline(cls, value):
+        return _normalize_deadline(value)
 
 
 class CampaignPatch(BaseModel):
     title: str | None = None
     description: str | None = None
     date: Date | None = None
-    deadline: Date | None = None
+    deadline: DateTime | None = None
     parent_nc_path: str | None = None
     selected_org_types: list[OrganizationType] | None = None
     allowed_extensions: list[str] | None = None
     allowed_mime_types: list[str] | None = None
     status: str | None = None
+
+    @field_validator("deadline", mode="before")
+    @classmethod
+    def normalize_deadline(cls, value):
+        return _normalize_deadline(value)
+
+
+class CampaignMoveIn(BaseModel):
+    target_nc_path: str
 
 
 class SelectOrganizationsIn(BaseModel):
@@ -108,3 +124,15 @@ class OperationPreview(BaseModel):
     status: str
     summary: dict[str, Any]
     items: list[dict[str, Any]]
+
+
+def _normalize_deadline(value):
+    if value in (None, ""):
+        return None
+    if isinstance(value, DateTime):
+        return value
+    if isinstance(value, Date):
+        return DateTime.combine(value, Time(23, 59))
+    if isinstance(value, str) and len(value) == 10:
+        return f"{value}T23:59:00"
+    return value

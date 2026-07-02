@@ -491,6 +491,14 @@
     }
 
     function shell(content, title, subtitle, actions = "") {
+      const topbar = title || subtitle || actions
+        ? `
+          <div class="mrm-topbar">
+            <div>${title ? `<h2>${h(title)}</h2>` : ""}${subtitle ? `<p>${h(subtitle)}</p>` : ""}</div>
+            <div class="mrm-actions">${actions}</div>
+          </div>
+        `
+        : ""
       return `
         <div class="mrm-shell">
           <aside class="mrm-sidebar">
@@ -511,10 +519,7 @@
             </nav>
           </aside>
           <main class="mrm-main">
-            <div class="mrm-topbar">
-              <div><h2>${h(title)}</h2>${subtitle ? `<p>${h(subtitle)}</p>` : ""}</div>
-              <div class="mrm-actions">${actions}</div>
-            </div>
+            ${topbar}
             ${content}
           </main>
         </div>
@@ -545,16 +550,9 @@
               <button class="mrm-button" type="button" data-view="campaigns">Создать мониторинг</button>
             </div>
           </div>
-          <div class="mrm-panel mrm-steps">
-            <div class="mrm-step"><strong>1</strong><span>Добавьте организации в список ОУ или импортируйте XLSX/CSV.</span></div>
-            <div class="mrm-step"><strong>2</strong><span>Создайте мониторинг: название, путь и типы ОУ.</span></div>
-            <div class="mrm-step"><strong>3</strong><span>Проверьте план папок и примените создание в Nextcloud.</span></div>
-            <div class="mrm-step"><strong>4</strong><span>Создайте публичные ссылки для загрузки и выгрузите рассылку.</span></div>
-            <div class="mrm-step"><strong>5</strong><span>После загрузки файлов запустите проверку, переименование и отчёт.</span></div>
-          </div>
           <div class="mrm-stat"><strong>${state.campaigns.length}</strong><span>Мониторингов</span></div>
           <div class="mrm-stat"><strong>${active}</strong><span>Активных</span></div>
-          <div class="mrm-stat"><strong>${state.organizations.length}</strong><span>Записей списка ОУ</span></div>
+          <div class="mrm-stat"><strong>${state.organizations.length}</strong><span>Количество ОУ</span></div>
           <div class="mrm-stat"><strong>${orgsWithoutEmail}</strong><span>Без email</span></div>
           <div class="mrm-panel">
             <div class="mrm-panel-header"><h3>Последние мониторинги</h3></div>
@@ -573,10 +571,8 @@
           </div>
         </section>
         `,
-        "Обзор",
-        "Порядок работы и текущее состояние",
-        `<button class="mrm-button primary" type="button" data-view="campaigns">Создать мониторинг</button>
-         <button class="mrm-button" type="button" data-view="organizations">Список ОУ</button>`,
+        "",
+        "",
       )
     }
 
@@ -611,11 +607,11 @@
             <h3>${editing ? "Редактирование" : "Добавить запись"}</h3>
             <div class="mrm-fields">
               <div class="mrm-field">
-                <label>Тип ОУ</label>
-                <select name="type">${orgTypeOptions(editing?.type || "school")}</select>
+                <label>Тип ОУ *</label>
+                <select name="type" required>${orgTypeOptions(editing?.type || "school")}</select>
               </div>
               <div class="mrm-field">
-                <label>Номер</label>
+                <label>Номер *</label>
                 <input name="code" value="${h(editing?.code)}" required>
               </div>
               <div class="mrm-field">
@@ -637,12 +633,14 @@
               </div>
             </div>
             <div class="mrm-panel-body">
-              <div class="mrm-segmented" role="tablist" aria-label="Фильтр типа ОУ">
-                ${filterOptions
-                  .map(([value, label]) => `<button class="${state.organizationFilter === value ? "is-active" : ""}" type="button" data-org-filter="${h(value)}">${h(label)}</button>`)
-                  .join("")}
+              <div class="mrm-list-tools">
+                <div class="mrm-segmented" role="tablist" aria-label="Фильтр типа ОУ">
+                  ${filterOptions
+                    .map(([value, label]) => `<button class="${state.organizationFilter === value ? "is-active" : ""}" type="button" data-org-filter="${h(value)}">${h(label)}</button>`)
+                    .join("")}
+                </div>
+                <p class="mrm-hint">Колонки для импорта: Тип ОУ, Номер, Email.</p>
               </div>
-              <p class="mrm-hint">Колонки для импорта: Тип ОУ, Номер, Email.</p>
             </div>
             <div class="mrm-table-wrap">
               <table class="mrm-table">
@@ -693,9 +691,6 @@
           <div class="mrm-panel mrm-wide-panel">
             <div class="mrm-panel-header">
               <h3>Мониторинги</h3>
-              <select data-selected-campaign>
-                ${state.campaigns.map((item) => `<option value="${h(item.id)}" ${state.selectedCampaignId === item.id ? "selected" : ""}>${h(item.title)}</option>`).join("")}
-              </select>
             </div>
             <div class="mrm-table-wrap">
               <table class="mrm-table">
@@ -724,7 +719,7 @@
         </section>
         `,
         "Мониторинги",
-        "Папки, ссылки, рассылка и проверка файлов",
+        "Главный каталог, в котором будут выполняться массовые операции, проверки и рассылки для ОУ из списка",
       )
     }
 
@@ -745,13 +740,13 @@
                 <div class="mrm-op-card">
                   <span>Папки организаций</span>
                   <strong>Создать папки для всех</strong>
-                  <p>Для всех выбранных ОУ будет создана папка с номером в корне папки мониторинга.</p>
+                  <p>Для всех выбранных ОУ будет создана папка с номером в корне папки мониторинга. Если выбрано несколько типов ОУ - они будут разбиты на группы.</p>
                   <div class="mrm-actions"><button class="mrm-button" type="button" data-op="folders-preview">Preview</button><button class="mrm-button primary" type="button" data-op="folders-apply">Создать</button></div>
                 </div>
                 <div class="mrm-op-card">
                   <span>Публикация</span>
                   <strong>Ссылки для загрузки</strong>
-                  <p>Создаёт публичные upload-ссылки и готовит таблицу рассылки.</p>
+                  <p>Создаёт для каждой папки ОУ публичную upload-ссылку и готовит таблицу с их перечислением. Для работы требуется создать папки в первой операции.</p>
                   <div class="mrm-actions"><button class="mrm-button" type="button" data-op="shares-preview">Preview</button><button class="mrm-button primary" type="button" data-op="shares-apply">Создать ссылки</button></div>
                 </div>
                 <div class="mrm-op-card">
@@ -780,10 +775,7 @@
             <div class="mrm-panel-header">
               <h3>Результат последней операции</h3>
               <div class="mrm-actions">
-                <button class="mrm-button" type="button" data-download="campaign-links.csv">Ссылки CSV</button>
                 <button class="mrm-button" type="button" data-download="campaign-links.xlsx">Ссылки XLSX</button>
-                <button class="mrm-button" type="button" data-download="campaign-mailing.csv">Рассылка CSV</button>
-                <button class="mrm-button" type="button" data-download="campaign-mailing.xlsx">Рассылка XLSX</button>
                 <button class="mrm-button" type="button" data-download="campaign-report.xlsx">Отчёт XLSX</button>
                 <button class="mrm-button" type="button" data-download="campaign-message.txt">Текст</button>
               </div>
@@ -793,7 +785,7 @@
         </section>
         `,
         "Операции",
-        "Работайте сверху вниз: preview показывает план, apply выполняет изменения",
+        "Автоматическая подготовка мониторинга и сортировка файлов",
       )
     }
 
