@@ -9,4 +9,6 @@ data/
 *.sqlite3
 *.db
 .env
-
+mail_bridge_token
+work-mail-bridge-token.txt
+*mail*bridge*token*.txt

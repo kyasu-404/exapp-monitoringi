@@ -33,6 +33,7 @@ try {
     $mailer->send($message);
     echo json_encode(['status' => 'sent']);
 } catch (Throwable $e) {
+    error_log('OO file collector mail bridge failed: ' . $e->getMessage());
     http_response_code(502);
-    echo json_encode(['error' => $e->getMessage()]);
+    echo json_encode(['error' => 'mail_send_failed']);
 }

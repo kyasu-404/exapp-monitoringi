@@ -88,6 +88,8 @@ SessionDep = Annotated[Session, Depends(get_session)]
 CLEANUP_DUPLICATES_FOLDER = "Дубли"
 CLEANUP_TRASH_FOLDER = "Мусор"
 CLEANUP_FOLDERS = {CLEANUP_DUPLICATES_FOLDER, CLEANUP_TRASH_FOLDER}
+ROOT_REQUIRED_PERMISSIONS = {"G", "C", "K"}
+GROUP_SHARE_PERMISSIONS = 31
 
 
 def _user(request: Request) -> str | None:
@@ -107,6 +109,18 @@ def _raise(exc: AppError) -> None:
 
 def _model_json(model) -> dict[str, Any]:
     return model.model_dump(mode="json")
+
+
+def _collaboration_group(settings: dict[str, Any]) -> str:
+    return str(settings.get("collaboration_group") or "").strip()
+
+
+def _credentials_with_values(session: Session, request: Request, values: dict[str, Any]) -> dict[str, Any]:
+    overrides = nextcloud_overrides(session, _user(request))
+    for key in ("nc_base_url", "nc_user", "nc_app_password", "root_path"):
+        if values.get(key):
+            overrides[key] = values[key]
+    return overrides
 
 
 def _delete_campaign_record(session: Session, campaign: Campaign, *, user_id: str | None = None, reason: str = "deleted") -> None:
@@ -352,6 +366,60 @@ async def _webdav_folder_exists(client: NextcloudClient, path: str) -> bool:
     return bool(entries and entries[0].is_collection)
 
 
+async def _root_access_status(
+    client: NextcloudClient,
+    root_path: str,
+    group_id: str,
+    *,
+    ensure_share: bool,
+) -> dict[str, Any]:
+    entries = await client.propfind(root_path, depth=0)
+    entry = entries[0] if entries else None
+    if entry is None:
+        raise AppError("ROOT_FOLDER_NOT_FOUND", "Корневая папка мониторингов не найдена в Nextcloud.", 400, root_path)
+    if not entry.is_collection:
+        raise AppError("ROOT_PATH_NOT_FOLDER", "Корневой путь мониторингов занят файлом.", 400, root_path)
+
+    permissions = entry.permissions or ""
+    missing_permissions = sorted(ROOT_REQUIRED_PERMISSIONS.difference(permissions))
+    mode = "team_folder" if entry.mount_type == "group" else "owner_folder"
+    share_result: dict[str, Any] | None = None
+    normalized_root = ensure_under_root(root_path, root_path)
+    if entry.mount_type == "shared":
+        mode = "received_share"
+    elif entry.mount_type != "group" and group_id:
+        if normalized_root == "/":
+            raise AppError("ROOT_SHARE_NOT_SUPPORTED", "Нельзя выдавать группе общий доступ на корень файлов пользователя. Укажите папку, например /Мониторинги.", 400)
+        mode = "group_share_fallback"
+        if ensure_share:
+            share_result = await client.ensure_group_share(
+                normalized_root,
+                group_id,
+                permissions=GROUP_SHARE_PERMISSIONS,
+                label="Сбор файлов ОО",
+                note="Доступ к корневой папке мониторингов",
+            )
+    elif entry.mount_type != "group":
+        mode = "owner_folder"
+
+    status = "ok"
+    if missing_permissions:
+        status = "warning"
+    return {
+        "status": status,
+        "path": entry.path,
+        "mode": mode,
+        "is_group_folder": entry.mount_type == "group",
+        "mount_type": entry.mount_type or "local",
+        "is_mount_root": entry.is_mount_root,
+        "owner_id": entry.owner_id,
+        "permissions": permissions,
+        "missing_permissions": missing_permissions,
+        "collaboration_group": group_id or "",
+        "share": share_result,
+    }
+
+
 def _folder_paths_to_verify(
     campaign: Campaign,
     campaign_orgs: list[CampaignOrganization],
@@ -484,7 +552,7 @@ async def _apply_scan_file_operations(
     campaign: Campaign,
     request: Request,
     classified,
-) -> tuple[dict[str, str], dict[str, dict[str, str | None]], dict[str, int]]:
+) -> tuple[dict[str, str], dict[str, dict[str, str | None]], dict[str, int], str | None]:
     current_paths: dict[str, str] = {}
     operations: dict[str, dict[str, str | None]] = {}
     summary = {
@@ -493,6 +561,7 @@ async def _apply_scan_file_operations(
         "renamed": 0,
         "operation_errors": 0,
     }
+    batch_items: list[dict[str, Any]] = []
 
     async with NextcloudClient(_nc_credentials(session, request)) as client:
         await client.mkcol(join_nc_path(campaign.campaign_folder_path, CLEANUP_DUPLICATES_FOLDER))
@@ -506,17 +575,19 @@ async def _apply_scan_file_operations(
             folder = CLEANUP_DUPLICATES_FOLDER if item.classification == "duplicate" else CLEANUP_TRASH_FOLDER
             action = "move_duplicate" if item.classification == "duplicate" else "move_trash"
             target_path = _cleanup_target_path(campaign, folder, item.candidate.path)
-            try:
-                await client.move(item.candidate.path, target_path)
-                current_paths[item.candidate.path] = target_path
-                operations[item.candidate.path] = {"action": action, "target_path": target_path, "status": "success", "error": None}
-                if item.classification == "duplicate":
-                    summary["duplicates_moved"] += 1
-                else:
-                    summary["trash_moved"] += 1
-            except Exception as exc:  # noqa: BLE001 - return per-file cleanup errors to UI
-                summary["operation_errors"] += 1
-                operations[item.candidate.path] = {"action": action, "target_path": target_path, "status": "failed", "error": str(exc)}
+            batch_items.append(
+                {
+                    "action": "move",
+                    "source_path": item.candidate.path,
+                    "target_path": target_path,
+                    "reason": item.reason or item.classification,
+                    "metadata_json": {
+                        "scan_action": action,
+                        "classification": item.classification,
+                        "candidate_path": item.candidate.path,
+                    },
+                }
+            )
 
         for item in classified:
             if item.classification != "valid" or _is_cleanup_path(campaign, item.candidate.path):
@@ -527,16 +598,62 @@ async def _apply_scan_file_operations(
                 target_path = f"/{target_path}"
             if target_path == item.candidate.path:
                 continue
-            try:
-                await client.move(item.candidate.path, target_path)
-                current_paths[item.candidate.path] = target_path
-                operations[item.candidate.path] = {"action": "rename_kept", "target_path": target_path, "status": "success", "error": None}
-                summary["renamed"] += 1
-            except Exception as exc:  # noqa: BLE001 - return per-file cleanup errors to UI
-                summary["operation_errors"] += 1
-                operations[item.candidate.path] = {"action": "rename_kept", "target_path": target_path, "status": "failed", "error": str(exc)}
+            batch_items.append(
+                {
+                    "action": "rename",
+                    "source_path": item.candidate.path,
+                    "target_path": target_path,
+                    "reason": "normalized_filename",
+                    "metadata_json": {
+                        "scan_action": "rename_kept",
+                        "classification": item.classification,
+                        "candidate_path": item.candidate.path,
+                    },
+                }
+            )
 
-    return current_paths, operations, summary
+        batch = None
+        if batch_items:
+            batch = create_batch(
+                session,
+                operation_type="scan_cleanup",
+                campaign_id=campaign.id,
+                user_id=_user(request),
+                items=batch_items,
+                summary={"planned": len(batch_items)},
+            )
+            batch = await apply_batch(session, batch, client)
+
+    if not batch_items:
+        return current_paths, operations, summary, None
+
+    assert batch is not None
+    batch_id = batch.id
+    for operation_item in session.exec(select(OperationItem).where(OperationItem.batch_id == batch_id)).all():
+        metadata = operation_item.metadata_json or {}
+        candidate_path = metadata.get("candidate_path") or operation_item.source_path or ""
+        action = metadata.get("scan_action") or "move_trash"
+        if not candidate_path:
+            continue
+        status = operation_item.status.value if hasattr(operation_item.status, "value") else str(operation_item.status)
+        operations[candidate_path] = {
+            "action": action,
+            "target_path": operation_item.target_path,
+            "status": "success" if operation_item.status == OperationItemStatus.success else "failed",
+            "error": operation_item.error,
+        }
+        if operation_item.status == OperationItemStatus.success:
+            current_paths[candidate_path] = operation_item.target_path or candidate_path
+            if action == "move_duplicate":
+                summary["duplicates_moved"] += 1
+            elif action == "move_trash":
+                summary["trash_moved"] += 1
+            elif action == "rename_kept":
+                summary["renamed"] += 1
+        elif status == "failed":
+            summary["operation_errors"] += 1
+
+    return current_paths, operations, summary, batch_id
 
 
 @router.get("/health")
@@ -834,11 +951,14 @@ async def list_campaigns(session: SessionDep, request: Request, status: str | No
 async def create_campaign(payload: CampaignIn, session: SessionDep, request: Request) -> dict[str, Any]:
     settings = settings_map(session, include_secret=True)
     root_path = settings.get("root_path") or payload.parent_nc_path
+    group_id = _collaboration_group(settings)
+    root_access: dict[str, Any] | None = None
     try:
         parent = ensure_under_root(payload.parent_nc_path, root_path)
         folder = campaign_folder_path(parent, payload.date, payload.title)
         ensure_under_root(folder, root_path)
         async with NextcloudClient(_nc_credentials(session, request)) as client:
+            root_access = await _root_access_status(client, root_path, group_id, ensure_share=True)
             await client.mkcol(folder)
             entries = await client.propfind(folder, depth=0)
             if not entries or not entries[0].is_collection:
@@ -858,7 +978,14 @@ async def create_campaign(payload: CampaignIn, session: SessionDep, request: Req
         created_by=_user(request),
     )
     session.add(campaign)
-    audit(session, user_id=_user(request), action="create", entity_type="campaign", entity_id=campaign.id, after=campaign.model_dump(mode="json"))
+    audit(
+        session,
+        user_id=_user(request),
+        action="create",
+        entity_type="campaign",
+        entity_id=campaign.id,
+        after={**campaign.model_dump(mode="json"), "root_access": root_access},
+    )
     session.commit()
     session.refresh(campaign)
     return _model_json(campaign)
@@ -1395,7 +1522,7 @@ def _message_items_for_missing(session: Session, campaign: Campaign, check_resul
                 "subject": subject,
                 "body": body,
                 "status": "pending" if org.email else "failed",
-                "last_error": None if org.email else "? ??????????? ?? ?????? email.",
+                "last_error": None if org.email else "У организации не указан email.",
             }
         )
     return result
@@ -1425,8 +1552,6 @@ async def _send_message_batch_worker(batch_id: str, credentials_data: dict[str, 
         batch.queued_at = batch.queued_at or utcnow()
         session.add(batch)
         session.commit()
-        success = 0
-        failed = 0
         items = session.exec(select(MessageItem).where(MessageItem.batch_id == batch.id, MessageItem.status == MailItemStatus.pending)).all()
         for item in items:
             item.status = MailItemStatus.sending
@@ -1440,11 +1565,9 @@ async def _send_message_batch_worker(batch_id: str, credentials_data: dict[str, 
                 item.status = MailItemStatus.sent
                 item.sent_at = utcnow()
                 item.last_error = None
-                success += 1
             except Exception as exc:  # noqa: BLE001 - persist per-message delivery errors
                 item.status = MailItemStatus.failed
                 item.last_error = str(exc)
-                failed += 1
                 audit(
                     session,
                     user_id=user_id,
@@ -1459,10 +1582,14 @@ async def _send_message_batch_worker(batch_id: str, credentials_data: dict[str, 
             session.add(item)
             session.commit()
             await asyncio.sleep(1)
-        remaining = session.exec(select(MessageItem).where(MessageItem.batch_id == batch.id, MessageItem.status == MailItemStatus.pending)).all()
-        batch.finished_at = utcnow() if not remaining else None
+        all_items = session.exec(select(MessageItem).where(MessageItem.batch_id == batch.id)).all()
+        pending = len([item for item in all_items if item.status == MailItemStatus.pending])
+        sending = len([item for item in all_items if item.status == MailItemStatus.sending])
+        sent = len([item for item in all_items if item.status == MailItemStatus.sent])
+        failed = len([item for item in all_items if item.status == MailItemStatus.failed])
+        batch.finished_at = utcnow() if not pending and not sending else None
         batch.status = BatchStatus.completed_with_errors if failed else BatchStatus.completed
-        batch.summary_json = {**(batch.summary_json or {}), "sent": success, "failed": failed, "pending": len(remaining)}
+        batch.summary_json = {**(batch.summary_json or {}), "planned": len(all_items), "sent": sent, "failed": failed, "pending": pending}
         session.add(batch)
         audit(session, user_id=user_id, action="mail_batch_send", entity_type="message_batch", entity_id=batch.id, after=batch.summary_json)
         session.commit()
@@ -1555,7 +1682,7 @@ async def scan_apply(campaign_id: str, session: SessionDep, request: Request, pa
     except AppError as exc:
         _raise(exc)
     try:
-        current_paths, file_operations, cleanup_summary = await _apply_scan_file_operations(session, campaign, request, classified)
+        current_paths, file_operations, cleanup_summary, cleanup_batch_id = await _apply_scan_file_operations(session, campaign, request, classified)
     except AppError as exc:
         _raise(exc)
     campaign_orgs = _campaign_orgs(session, campaign)
@@ -1567,10 +1694,11 @@ async def scan_apply(campaign_id: str, session: SessionDep, request: Request, pa
         created_by=_user(request),
     )
     session.add(check_result)
-    audit(session, user_id=_user(request), action="scan_apply", entity_type="campaign", entity_id=campaign.id, after={"files": len(classified), "check_result_id": check_result.id, **cleanup_summary})
+    audit(session, user_id=_user(request), action="scan_apply", entity_type="campaign", entity_id=campaign.id, after={"files": len(classified), "check_result_id": check_result.id, "cleanup_batch_id": cleanup_batch_id, **cleanup_summary})
     session.commit()
     status = "completed_with_errors" if cleanup_summary.get("operation_errors") else "completed"
     payload = _scan_payload(session, campaign, classified, status=status, file_operations=file_operations, extra_summary=cleanup_summary)
+    payload["batch_id"] = cleanup_batch_id
     payload["check_result_id"] = check_result.id
     payload["check_result_created_at"] = check_result.created_at.isoformat()
     payload["summary"]["missing"] = len(missing)
@@ -1650,7 +1778,7 @@ def messages_preview(campaign_id: str, session: SessionDep) -> dict[str, Any]:
     campaign = _get_campaign(session, campaign_id)
     check_result = _latest_check_result(session, campaign.id)
     if check_result is None:
-        raise HTTPException(status_code=400, detail={"code": "CHECK_RESULT_REQUIRED", "message": "??????? ????????? ? ????????? ???????? ??????."})
+        raise HTTPException(status_code=400, detail={"code": "CHECK_RESULT_REQUIRED", "message": "Сначала выполните и сохраните проверку файлов."})
     items = _message_items_for_missing(session, campaign, check_result)
     return {
         "operation_type": "messages",
@@ -1668,7 +1796,7 @@ def messages_prepare(campaign_id: str, session: SessionDep, request: Request) ->
     campaign = _get_campaign(session, campaign_id)
     check_result = _latest_check_result(session, campaign.id)
     if check_result is None:
-        raise HTTPException(status_code=400, detail={"code": "CHECK_RESULT_REQUIRED", "message": "??????? ????????? ? ????????? ???????? ??????."})
+        raise HTTPException(status_code=400, detail={"code": "CHECK_RESULT_REQUIRED", "message": "Сначала выполните и сохраните проверку файлов."})
     planned = _message_items_for_missing(session, campaign, check_result)
     batch = MessageBatch(
         campaign_id=campaign.id,
@@ -1704,7 +1832,7 @@ def messages_prepare(campaign_id: str, session: SessionDep, request: Request) ->
 async def messages_send(batch_id: str, background_tasks: BackgroundTasks, session: SessionDep, request: Request) -> dict[str, Any]:
     batch = session.get(MessageBatch, batch_id)
     if batch is None:
-        raise HTTPException(status_code=404, detail={"code": "MESSAGE_BATCH_NOT_FOUND", "message": "????? ????? ?? ??????."})
+        raise HTTPException(status_code=404, detail={"code": "MESSAGE_BATCH_NOT_FOUND", "message": "Пакет писем не найден."})
     if batch.status == BatchStatus.running:
         return _message_batch_payload(session, batch)
     batch.status = BatchStatus.running
@@ -1720,7 +1848,7 @@ async def messages_send(batch_id: str, background_tasks: BackgroundTasks, sessio
 def message_batch_get(batch_id: str, session: SessionDep) -> dict[str, Any]:
     batch = session.get(MessageBatch, batch_id)
     if batch is None:
-        raise HTTPException(status_code=404, detail={"code": "MESSAGE_BATCH_NOT_FOUND", "message": "????? ????? ?? ??????."})
+        raise HTTPException(status_code=404, detail={"code": "MESSAGE_BATCH_NOT_FOUND", "message": "Пакет писем не найден."})
     return _message_batch_payload(session, batch)
 
 
@@ -1728,14 +1856,15 @@ def message_batch_get(batch_id: str, session: SessionDep) -> dict[str, Any]:
 def message_batch_xlsx(batch_id: str, session: SessionDep) -> Response:
     batch = session.get(MessageBatch, batch_id)
     if batch is None:
-        raise HTTPException(status_code=404, detail={"code": "MESSAGE_BATCH_NOT_FOUND", "message": "????? ????? ?? ??????."})
+        raise HTTPException(status_code=404, detail={"code": "MESSAGE_BATCH_NOT_FOUND", "message": "Пакет писем не найден."})
     items = session.exec(select(MessageItem).where(MessageItem.batch_id == batch.id)).all()
+    columns = ["Email", "Тема", "Текст", "Статус", "Ошибка"]
     rows = [
-        {"Email": item.to_email, "????": item.subject, "?????": item.body, "??????": item.status.value if hasattr(item.status, "value") else str(item.status), "??????": item.last_error or ""}
+        {"Email": item.to_email, "Тема": item.subject, "Текст": item.body, "Статус": item.status.value if hasattr(item.status, "value") else str(item.status), "Ошибка": item.last_error or ""}
         for item in items
     ]
     return Response(
-        xlsx_bytes(rows, ["Email", "????", "?????", "??????", "??????"], sheet_name="??????"),
+        xlsx_bytes(rows, columns, sheet_name="Письма"),
         media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         headers={"Content-Disposition": f'attachment; filename="messages-{batch.id}.xlsx"'},
     )
@@ -1745,7 +1874,7 @@ def message_batch_xlsx(batch_id: str, session: SessionDep) -> Response:
 def message_batch_txt(batch_id: str, session: SessionDep) -> Response:
     batch = session.get(MessageBatch, batch_id)
     if batch is None:
-        raise HTTPException(status_code=404, detail={"code": "MESSAGE_BATCH_NOT_FOUND", "message": "????? ????? ?? ??????."})
+        raise HTTPException(status_code=404, detail={"code": "MESSAGE_BATCH_NOT_FOUND", "message": "Пакет писем не найден."})
     items = session.exec(select(MessageItem).where(MessageItem.batch_id == batch.id)).all()
     chunks = []
     for item in items:
@@ -1991,25 +2120,36 @@ def get_settings(session: SessionDep) -> dict[str, Any]:
 
 
 @router.put("/settings")
-def put_settings(payload: SettingsIn, session: SessionDep, request: Request) -> dict[str, Any]:
+async def put_settings(payload: SettingsIn, session: SessionDep, request: Request) -> dict[str, Any]:
     before = settings_map(session)
     values = payload.model_dump(exclude_unset=True)
     if values.get("root_path"):
         values["root_path"] = ensure_under_root(values["root_path"], values["root_path"])
     root_path = values.get("root_path") or before.get("root_path") or "/"
+    if "collaboration_group" in values:
+        values["collaboration_group"] = str(values.get("collaboration_group") or "").strip()
+    group_id = str(values.get("collaboration_group") if "collaboration_group" in values else before.get("collaboration_group") or "").strip()
     if values.get("archive_folder") and str(values["archive_folder"]).startswith("/"):
         values["archive_folder"] = ensure_under_root(values["archive_folder"], root_path)
+    try:
+        async with NextcloudClient(configured_credentials(_credentials_with_values(session, request, {**values, "root_path": root_path}))) as client:
+            root_access = await _root_access_status(client, root_path, group_id, ensure_share=True)
+    except AppError as exc:
+        _raise(exc)
     after = update_settings(session, values)
-    audit(session, user_id=_user(request), action="update", entity_type="settings", before=before, after=after)
+    audit(session, user_id=_user(request), action="update", entity_type="settings", before=before, after={**after, "root_access": root_access})
     session.commit()
-    return after
+    return {**after, "root_access": root_access}
 
 
 @router.post("/settings/test-webdav")
 async def test_webdav(session: SessionDep, request: Request) -> dict[str, Any]:
     try:
         async with NextcloudClient(_nc_credentials(session, request)) as client:
-            return await client.test_webdav()
+            settings = settings_map(session, include_secret=True)
+            root_path = settings.get("root_path") or client.credentials.root_path
+            group_id = _collaboration_group(settings)
+            return await _root_access_status(client, root_path, group_id, ensure_share=False)
     except AppError as exc:
         _raise(exc)
 

@@ -4,7 +4,7 @@ import pytest
 from sqlmodel import Session, SQLModel, create_engine, select
 
 from monitoringi.models import Campaign, CampaignOrganization, CampaignOrganizationStatus, OperationItem, OperationItemStatus, Organization
-from monitoringi.reports import link_rows, mailing_rows, render_template
+from monitoringi.reports import csv_bytes, link_rows, mailing_rows, render_template, spreadsheet_safe_value
 from monitoringi.services import apply_batch, create_batch, parse_organization_table, planned_folder_items
 
 
@@ -52,6 +52,24 @@ def test_import_organizations_adds_default_aliases_when_missing():
 
     assert rows[0]["type"] == "kindergarten"
     assert rows[0]["aliases"] == ["\u0414\u041e\u0423"]
+
+
+def test_import_organizations_csv_falls_back_without_sniffer_header():
+    content = "Тип ОУ;Номер;Email\nШколы;1;school@example.test\n".encode("utf-8")
+
+    rows = parse_organization_table("orgs.csv", content)
+
+    assert rows[0]["type"] == "school"
+    assert rows[0]["code"] == "1"
+
+
+def test_spreadsheet_exports_escape_formula_like_values():
+    assert spreadsheet_safe_value("=HYPERLINK(\"https://example.test\")") == "'=HYPERLINK(\"https://example.test\")"
+    assert spreadsheet_safe_value("  @cmd") == "'  @cmd"
+
+    content = csv_bytes([{"Name": "=1+1"}], ["Name"]).decode("utf-8-sig")
+
+    assert "'=1+1" in content
 
 
 def test_generate_mail_template():

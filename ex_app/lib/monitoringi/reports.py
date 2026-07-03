@@ -46,12 +46,27 @@ LINK_COLUMNS = [
     "Ссылка для загрузки",
 ]
 
+FORMULA_PREFIXES = ("=", "+", "-", "@", "\t", "\r")
+
 
 def render_template(template: str, values: dict[str, str | None]) -> str:
     result = template
     for key, value in values.items():
         result = result.replace("{" + key + "}", value or "")
     return result
+
+
+def spreadsheet_safe_value(value):
+    if not isinstance(value, str):
+        return value
+    stripped = value.lstrip()
+    if stripped.startswith(FORMULA_PREFIXES):
+        return "'" + value
+    return value
+
+
+def spreadsheet_safe_row(values: Iterable) -> list:
+    return [spreadsheet_safe_value(value) for value in values]
 
 
 def _organization_type_value(organization: Organization) -> str:
@@ -155,7 +170,7 @@ def csv_bytes(rows: Iterable[dict[str, str]], columns: list[str]) -> bytes:
     writer = csv.DictWriter(buffer, fieldnames=columns, extrasaction="ignore")
     writer.writeheader()
     for row in rows:
-        writer.writerow(row)
+        writer.writerow({column: spreadsheet_safe_value(row.get(column, "")) for column in columns})
     return buffer.getvalue().encode("utf-8-sig")
 
 
@@ -169,7 +184,7 @@ def xlsx_bytes(rows: Iterable[dict[str, str]], columns: list[str], *, sheet_name
         cell.font = Font(bold=True)
         cell.fill = fill
     for row in rows:
-        ws.append([row.get(column, "") for column in columns])
+        ws.append(spreadsheet_safe_row(row.get(column, "") for column in columns))
     for column_cells in ws.columns:
         width = min(max(len(str(cell.value or "")) for cell in column_cells) + 2, 60)
         ws.column_dimensions[column_cells[0].column_letter].width = width
@@ -187,7 +202,7 @@ def report_workbook(campaign: Campaign, files: list[FileRecord], missing: list[O
         key = item.classification.value if hasattr(item.classification, "value") else str(item.classification)
         counts[key] = counts.get(key, 0) + 1
     summary.append(["Показатель", "Значение"])
-    summary.append(["Мониторинг", campaign.title])
+    summary.append(spreadsheet_safe_row(["Мониторинг", campaign.title]))
     summary.append(["Всего файлов", len(files)])
     summary.append(["Корректных файлов", counts.get("valid", 0)])
     summary.append(["Дублей", counts.get("duplicate", 0)])
@@ -199,7 +214,7 @@ def report_workbook(campaign: Campaign, files: list[FileRecord], missing: list[O
     missing_sheet = wb.create_sheet("Не предоставили")
     missing_sheet.append(["Тип", "Код", "Организация", "Email"])
     for org in sorted(missing, key=organization_sort_key):
-        missing_sheet.append([_organization_type_label(_organization_type_value(org)), org.code, org.display_name, org.email or ""])
+        missing_sheet.append(spreadsheet_safe_row([_organization_type_label(_organization_type_value(org)), org.code, org.display_name, org.email or ""]))
     _append_files_sheet(wb, "Дубли", [item for item in files if str(item.classification).endswith("duplicate") or item.classification == "duplicate"])
     _append_files_sheet(
         wb,
@@ -214,7 +229,7 @@ def report_workbook(campaign: Campaign, files: list[FileRecord], missing: list[O
     errors.append(["Файл", "Причина"])
     for item in files:
         if item.reason:
-            errors.append([item.original_name, item.reason])
+            errors.append(spreadsheet_safe_row([item.original_name, item.reason]))
 
     for ws in wb.worksheets:
         for cell in ws[1]:
@@ -236,7 +251,7 @@ def _append_files_sheet(wb: Workbook, title: str, files: list[FileRecord]) -> No
     ws.append(["Исходный путь", "Текущий путь", "Имя", "Расширение", "Размер", "Классификация", "Причина"])
     for item in files:
         classification = item.classification.value if hasattr(item.classification, "value") else str(item.classification)
-        ws.append([item.original_path, item.current_path, item.current_name, item.extension, item.size or "", classification, item.reason or ""])
+        ws.append(spreadsheet_safe_row([item.original_path, item.current_path, item.current_name, item.extension, item.size or "", classification, item.reason or ""]))
 
 
 def missing_message(campaign: Campaign, missing_by_type: dict[str, list[Organization]], template: str | None = None) -> str:

@@ -41,6 +41,10 @@ class WebDAVEntry:
     mime_type: str | None
     etag: str | None = None
     file_id: str | None = None
+    permissions: str | None = None
+    mount_type: str | None = None
+    is_mount_root: bool | None = None
+    owner_id: str | None = None
 
 
 def configured_credentials(overrides: dict | None = None) -> NextcloudCredentials:
@@ -160,6 +164,10 @@ class NextcloudClient:
     <d:getetag/>
     <oc:fileid/>
     <nc:fileid/>
+    <oc:permissions/>
+    <nc:mount-type/>
+    <nc:is-mount-root/>
+    <oc:owner-id/>
   </d:prop>
 </d:propfind>""",
         )
@@ -171,6 +179,18 @@ class NextcloudClient:
             raise NextcloudApiError("WEBDAV_PROPFIND_FAILED", "Не удалось получить список файлов.", 502, response.text)
         return self._parse_multistatus(response.text)
 
+    def _prop_from_response(self, item: ET.Element) -> ET.Element | None:
+        fallback: ET.Element | None = None
+        for propstat in item.findall("d:propstat", DAV_NS):
+            prop = propstat.find("d:prop", DAV_NS)
+            if prop is None:
+                continue
+            fallback = fallback or prop
+            status = propstat.findtext("d:status", default="", namespaces=DAV_NS)
+            if " 200 " in f" {status} ":
+                return prop
+        return fallback
+
     def _parse_multistatus(self, xml_text: str) -> list[WebDAVEntry]:
         root = ET.fromstring(xml_text)
         result: list[WebDAVEntry] = []
@@ -178,7 +198,7 @@ class NextcloudClient:
         for item in root.findall("d:response", DAV_NS):
             href = unquote(item.findtext("d:href", default="", namespaces=DAV_NS))
             path = "/" + href.split(prefix, 1)[-1].strip("/")
-            prop = item.find("d:propstat/d:prop", DAV_NS)
+            prop = self._prop_from_response(item)
             if prop is None:
                 continue
             is_collection = prop.find("d:resourcetype/d:collection", DAV_NS) is not None
@@ -187,6 +207,7 @@ class NextcloudClient:
             modified = prop.findtext("d:getlastmodified", default=None, namespaces=DAV_NS)
             etag = prop.findtext("d:getetag", default=None, namespaces=DAV_NS)
             file_id = prop.findtext("oc:fileid", default=None, namespaces=DAV_NS) or prop.findtext("nc:fileid", default=None, namespaces=DAV_NS)
+            mount_root = prop.findtext("nc:is-mount-root", default=None, namespaces=DAV_NS)
             result.append(
                 WebDAVEntry(
                     path=normalize_nc_path(path),
@@ -197,6 +218,10 @@ class NextcloudClient:
                     mime_type=mime_type,
                     etag=etag,
                     file_id=str(file_id) if file_id else None,
+                    permissions=prop.findtext("oc:permissions", default=None, namespaces=DAV_NS),
+                    mount_type=prop.findtext("nc:mount-type", default=None, namespaces=DAV_NS),
+                    is_mount_root=str(mount_root).casefold() == "true" if mount_root is not None else None,
+                    owner_id=prop.findtext("oc:owner-id", default=None, namespaces=DAV_NS),
                 )
             )
         return result
@@ -309,6 +334,93 @@ class NextcloudClient:
             "token": data.get("token"),
         }
 
+    async def shares_for_path(self, path: str) -> list[dict]:
+        safe_path = self._safe_path(path)
+        response = await self._client.get(
+            "/ocs/v2.php/apps/files_sharing/api/v1/shares",
+            params={"format": "json", "path": safe_path, "reshares": "true"},
+            headers={"OCS-APIRequest": "true", "Accept": "application/json"},
+        )
+        if response.status_code in {401, 403}:
+            raise NextcloudApiError("SHARE_API_FORBIDDEN", "Нет прав на просмотр общих доступов.", response.status_code)
+        if response.status_code >= 400:
+            raise NextcloudApiError("SHARE_API_FAILED", "Не удалось получить список общих доступов.", 502, response.text)
+        payload = response.json().get("ocs", {})
+        meta = payload.get("meta", {})
+        if int(meta.get("statuscode", 100)) >= 400:
+            raise NextcloudApiError("SHARE_API_FAILED", str(meta.get("message") or "Ошибка OCS Share API."), 502)
+        data = payload.get("data", [])
+        return data if isinstance(data, list) else []
+
+    async def update_share_permissions(self, share_id: str, permissions: int) -> None:
+        response = await self._client.put(
+            f"/ocs/v2.php/apps/files_sharing/api/v1/shares/{quote(str(share_id), safe='')}",
+            params={"format": "json"},
+            headers={"OCS-APIRequest": "true", "Accept": "application/json"},
+            data={"permissions": permissions},
+        )
+        if response.status_code in {401, 403}:
+            raise NextcloudApiError("SHARE_API_FORBIDDEN", "Нет прав на изменение общего доступа.", response.status_code)
+        if response.status_code >= 400:
+            raise NextcloudApiError("SHARE_UPDATE_FAILED", "Не удалось обновить общий доступ.", 502, response.text)
+        payload = response.json().get("ocs", {})
+        meta = payload.get("meta", {})
+        if int(meta.get("statuscode", 100)) >= 400:
+            raise NextcloudApiError("SHARE_UPDATE_FAILED", str(meta.get("message") or "Не удалось обновить общий доступ."), 502)
+
+    async def ensure_group_share(
+        self,
+        path: str,
+        group_id: str,
+        *,
+        permissions: int = 31,
+        label: str | None = None,
+        note: str | None = None,
+    ) -> dict[str, str | int | None]:
+        group_id = str(group_id or "").strip()
+        if not group_id:
+            return {"status": "skipped", "share_id": None, "permissions": None}
+        safe_path = self._safe_path(path)
+        for share in await self.shares_for_path(safe_path):
+            share_type = str(share.get("share_type") or share.get("shareType") or "")
+            share_with = str(share.get("share_with") or share.get("shareWith") or "")
+            if share_type == "1" and share_with == group_id:
+                share_id = str(share.get("id") or "")
+                current_permissions = int(share.get("permissions") or 0)
+                if share_id and current_permissions != permissions:
+                    await self.update_share_permissions(share_id, permissions)
+                return {"status": "existing", "share_id": share_id, "permissions": permissions}
+
+        form: dict[str, str | int] = {
+            "path": safe_path,
+            "shareType": 1,
+            "shareWith": group_id,
+            "permissions": permissions,
+        }
+        if label:
+            form["label"] = label
+        if note:
+            form["note"] = note
+        response = await self._client.post(
+            "/ocs/v2.php/apps/files_sharing/api/v1/shares",
+            params={"format": "json"},
+            headers={"OCS-APIRequest": "true", "Accept": "application/json"},
+            data=form,
+        )
+        if response.status_code in {401, 403}:
+            raise NextcloudApiError("SHARE_API_FORBIDDEN", "Нет прав на выдачу доступа группе.", response.status_code, response.text)
+        if response.status_code >= 400:
+            raise NextcloudApiError("SHARE_API_FAILED", "Не удалось выдать доступ группе.", 502, response.text)
+        payload = response.json().get("ocs", {})
+        meta = payload.get("meta", {})
+        if int(meta.get("statuscode", 100)) >= 400:
+            raise NextcloudApiError("SHARE_API_FAILED", str(meta.get("message") or "Ошибка OCS Share API."), 502)
+        data = payload.get("data", {})
+        share_id = str(data.get("id") or "")
+        if share_id:
+            await self.update_share_permissions(share_id, permissions)
+        return {"status": "created", "share_id": share_id, "permissions": permissions}
+
     async def delete_public_share(self, share_id: str) -> None:
         share_id = str(share_id or "").strip()
         if not share_id:
@@ -340,7 +452,7 @@ class NextcloudClient:
     async def send_service_mail(self, *, to_email: str, subject: str, body: str) -> None:
         token = _mail_bridge_token()
         if not token:
-            raise NextcloudApiError("MAIL_BRIDGE_TOKEN_MISSING", "?? ???????? bridge-????? ????????? ????? Nextcloud.", 500)
+            raise NextcloudApiError("MAIL_BRIDGE_TOKEN_MISSING", "Не найден bridge-токен почтового сервиса Nextcloud.", 500)
         response = await self._client.post(
             "/oo_file_collector_mail_bridge.php",
             json={"to": to_email, "subject": subject, "body": body},
@@ -348,12 +460,28 @@ class NextcloudClient:
         )
         if response.status_code in {200, 201, 202, 204}:
             return
-        raise NextcloudApiError("NEXTCLOUD_MAIL_SEND_FAILED", "Nextcloud ?? ???????? ?????? ????? ????????? ?????.", 502, response.text)
+        raise NextcloudApiError("NEXTCLOUD_MAIL_SEND_FAILED", "Nextcloud не отправил письмо через почтовый мост.", 502, response.text)
 
-
-    async def test_webdav(self) -> dict[str, str | int]:
+    async def test_webdav(self) -> dict[str, str | int | bool | None | list[str]]:
         entries = await self.propfind(self.credentials.root_path, depth=0)
-        return {"status": "ok", "entries": len(entries)}
+        entry = entries[0] if entries else None
+        if entry is None:
+            return {"status": "missing", "entries": 0}
+        permissions = entry.permissions or ""
+        required = {"G", "C", "K"}
+        missing = sorted(required.difference(permissions))
+        return {
+            "status": "ok" if entry.is_collection and not missing else "warning",
+            "entries": len(entries),
+            "path": entry.path,
+            "is_collection": entry.is_collection,
+            "permissions": permissions,
+            "missing_permissions": missing,
+            "mount_type": entry.mount_type or "local",
+            "is_group_folder": entry.mount_type == "group",
+            "is_mount_root": entry.is_mount_root,
+            "owner_id": entry.owner_id,
+        }
 
     async def test_share_api(self) -> dict[str, str]:
         response = await self._client.get(

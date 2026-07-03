@@ -43,7 +43,8 @@ class MailBridgeController extends Controller {
             $this->mailer->send($message);
             return new JSONResponse(['status' => 'sent']);
         } catch (\Throwable $e) {
-            return new JSONResponse(['error' => $e->getMessage()], 502);
+            error_log('OO file collector mail bridge failed: ' . $e->getMessage());
+            return new JSONResponse(['error' => 'mail_send_failed'], 502);
         }
     }
 }

@@ -5,6 +5,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Iterator
 
+from sqlalchemy import text
 from sqlmodel import Session, SQLModel, create_engine, select
 
 from .config import SETTINGS
@@ -49,6 +50,7 @@ def init_db() -> None:
         db_path.parent.mkdir(parents=True, exist_ok=True)
     SQLModel.metadata.create_all(get_engine())
     with Session(get_engine()) as session:
+        session.exec(text("CREATE UNIQUE INDEX IF NOT EXISTS uq_organization_type_code ON organization (type, code)"))
         default_template = session.exec(select(MailTemplate).where(MailTemplate.is_default == True)).first()  # noqa: E712
         if default_template is None:
             session.add(
@@ -69,6 +71,7 @@ def init_db() -> None:
             "duplicates_folder": SETTINGS.duplicates_folder,
             "invalid_folder": SETTINGS.invalid_folder,
             "archive_folder": SETTINGS.archive_folder,
+            "collaboration_group": "",
             "default_extensions": list(SETTINGS.default_extensions),
             "public_upload_default": True,
             "share_permissions": 4,

@@ -281,7 +281,11 @@ def _parse_csv(content: bytes) -> list[dict[str, Any]]:
     if text is None:
         text = content.decode("utf-8", errors="replace")
     sample = text[:2048]
-    dialect = csv.Sniffer().sniff(sample, delimiters=";,\t")
+    try:
+        dialect = csv.Sniffer().sniff(sample, delimiters=";,\t")
+    except csv.Error:
+        dialect = csv.excel()
+        dialect.delimiter = ";" if ";" in sample else ","
     reader = csv.DictReader(StringIO(text), dialect=dialect)
     rows = []
     for raw in reader:
@@ -478,6 +482,7 @@ async def apply_batch(session: Session, batch: OperationBatch, client: Nextcloud
                 session.add(item)
                 continue
             item.status = OperationItemStatus.success
+            item.error = None
             success += 1
         except Exception as exc:  # noqa: BLE001 - preserve per-item errors
             item.status = OperationItemStatus.failed

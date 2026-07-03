@@ -25,6 +25,24 @@ class OrganizationIn(BaseModel):
     sort_order: int = 0
     notes: str | None = None
 
+    @field_validator("code")
+    @classmethod
+    def normalize_code(cls, value: str) -> str:
+        value = str(value or "").strip()
+        if not value:
+            raise ValueError("Номер ОУ не должен быть пустым.")
+        return value
+
+    @field_validator("display_name", "short_name", "prefix", "notes", mode="before")
+    @classmethod
+    def strip_optional_text(cls, value):
+        return value.strip() if isinstance(value, str) else value
+
+    @field_validator("aliases", mode="before")
+    @classmethod
+    def normalize_aliases(cls, value):
+        return _normalize_string_list(value)
+
 
 class OrganizationPatch(BaseModel):
     type: OrganizationType | None = None
@@ -38,6 +56,26 @@ class OrganizationPatch(BaseModel):
     active: bool | None = None
     sort_order: int | None = None
     notes: str | None = None
+
+    @field_validator("code")
+    @classmethod
+    def normalize_code(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        value = str(value or "").strip()
+        if not value:
+            raise ValueError("Номер ОУ не должен быть пустым.")
+        return value
+
+    @field_validator("display_name", "short_name", "prefix", "notes", mode="before")
+    @classmethod
+    def strip_optional_text(cls, value):
+        return value.strip() if isinstance(value, str) else value
+
+    @field_validator("aliases", mode="before")
+    @classmethod
+    def normalize_aliases(cls, value):
+        return _normalize_string_list(value) if value is not None else None
 
 
 class OrganizationImportJsonIn(BaseModel):
@@ -60,6 +98,19 @@ class CampaignIn(BaseModel):
     def normalize_deadline(cls, value):
         return _normalize_deadline(value)
 
+    @field_validator("title", "parent_nc_path")
+    @classmethod
+    def strip_required_text(cls, value: str) -> str:
+        value = str(value or "").strip()
+        if not value:
+            raise ValueError("Поле не должно быть пустым.")
+        return value
+
+    @field_validator("allowed_extensions", mode="before")
+    @classmethod
+    def normalize_extensions(cls, value):
+        return _normalize_string_list(value)
+
 
 class CampaignPatch(BaseModel):
     title: str | None = None
@@ -76,6 +127,21 @@ class CampaignPatch(BaseModel):
     @classmethod
     def normalize_deadline(cls, value):
         return _normalize_deadline(value)
+
+    @field_validator("title", "parent_nc_path")
+    @classmethod
+    def strip_optional_required_text(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        value = str(value or "").strip()
+        if not value:
+            raise ValueError("Поле не должно быть пустым.")
+        return value
+
+    @field_validator("allowed_extensions", mode="before")
+    @classmethod
+    def normalize_extensions(cls, value):
+        return _normalize_string_list(value) if value is not None else None
 
 
 class CampaignMoveIn(BaseModel):
@@ -109,6 +175,7 @@ class BulkPathsIn(BaseModel):
 class SettingsIn(BaseModel):
     nc_base_url: str | None = None
     root_path: str | None = None
+    collaboration_group: str | None = None
     duplicates_folder: str | None = None
     invalid_folder: str | None = None
     archive_folder: str | None = None
@@ -116,6 +183,11 @@ class SettingsIn(BaseModel):
     public_upload_default: bool | None = None
     share_permissions: int | None = None
     max_file_size: int | None = None
+
+    @field_validator("nc_base_url", "root_path", "collaboration_group", "duplicates_folder", "invalid_folder", "archive_folder", mode="before")
+    @classmethod
+    def strip_optional_text(cls, value):
+        return value.strip() if isinstance(value, str) else value
 
 
 class OperationPreview(BaseModel):
@@ -136,3 +208,11 @@ def _normalize_deadline(value):
     if isinstance(value, str) and len(value) == 10:
         return f"{value}T23:59:00"
     return value
+
+
+def _normalize_string_list(value):
+    if value is None:
+        return []
+    if isinstance(value, str):
+        return [item.strip() for item in value.replace(";", ",").split(",") if item.strip()]
+    return [str(item).strip() for item in value if str(item).strip()]

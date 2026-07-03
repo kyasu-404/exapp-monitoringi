@@ -6,7 +6,7 @@ import os
 from contextlib import asynccontextmanager
 from pathlib import Path
 
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 from nc_py_api import NextcloudApp
 from nc_py_api.ex_app import AppAPIAuthMiddleware, LogLvl, run_app, set_handlers
@@ -16,6 +16,16 @@ from monitoringi.db import init_db
 from monitoringi.errors import AppError
 
 BASE_DIR = Path(__file__).resolve().parent.parent
+
+
+def _safe_asset(root: Path, path: str, media_type: str | None = None) -> FileResponse:
+    base = root.resolve()
+    target = (base / path).resolve()
+    if target != base and base not in target.parents:
+        raise HTTPException(status_code=404)
+    if not target.is_file():
+        raise HTTPException(status_code=404)
+    return FileResponse(target, media_type=media_type)
 
 
 @asynccontextmanager
@@ -59,17 +69,17 @@ async def index() -> HTMLResponse:
 
 @APP.get("/js/{path:path}")
 async def js_asset(path: str) -> FileResponse:
-    return FileResponse(BASE_DIR / "js" / path, media_type="application/javascript")
+    return _safe_asset(BASE_DIR / "js", path, "application/javascript")
 
 
 @APP.get("/css/{path:path}")
 async def css_asset(path: str) -> FileResponse:
-    return FileResponse(BASE_DIR / "css" / path, media_type="text/css")
+    return _safe_asset(BASE_DIR / "css", path, "text/css")
 
 
 @APP.get("/img/{path:path}")
 async def img_asset(path: str) -> FileResponse:
-    return FileResponse(BASE_DIR / "img" / path)
+    return _safe_asset(BASE_DIR / "img", path)
 
 
 def enabled_handler(enabled: bool, nc: NextcloudApp) -> str:

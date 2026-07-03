@@ -7,7 +7,7 @@ from enum import Enum
 from typing import Any
 from uuid import uuid4
 
-from sqlalchemy import Column
+from sqlalchemy import Column, UniqueConstraint
 from sqlalchemy import JSON as SAJSON
 from sqlmodel import Field, SQLModel
 
@@ -95,6 +95,8 @@ class MailItemStatus(str, Enum):
 
 
 class Organization(SQLModel, table=True):
+    __table_args__ = (UniqueConstraint("type", "code", name="uq_organization_type_code"),)
+
     id: str = Field(default_factory=new_id, primary_key=True)
     type: OrganizationType = Field(index=True)
     prefix: str | None = Field(default=None, index=True)

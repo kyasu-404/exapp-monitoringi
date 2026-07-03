@@ -803,7 +803,9 @@
     }
 
     function settings() {
+      const rootPath = state.settings.root_path || "/Мониторинги"
       const archiveFolder = state.settings.archive_folder || ""
+      const collaborationGroup = state.settings.collaboration_group || ""
       return shell(
         `
         <section class="mrm-grid">
@@ -811,21 +813,33 @@
             <h3>Настройки</h3>
             <div class="mrm-fields">
               <div class="mrm-field">
+                <label>Корневая папка</label>
+                <div class="mrm-input-action">
+                  <input name="root_path" value="${h(rootPath)}" required>
+                  <button class="mrm-button" type="button" data-pick-folder>Выбрать</button>
+                </div>
+              </div>
+              <div class="mrm-field">
                 <label>Каталог архива</label>
                 <div class="mrm-input-action">
                   <input name="archive_folder" value="${h(archiveFolder)}" required>
                   <button class="mrm-button" type="button" data-pick-folder>Выбрать</button>
                 </div>
               </div>
+              <div class="mrm-field">
+                <label>Группа доступа</label>
+                <input name="collaboration_group" value="${h(collaborationGroup)}">
+              </div>
               <div class="mrm-form-actions">
                 <button class="mrm-button primary" type="submit">Сохранить</button>
+                <button class="mrm-button" type="button" data-test-webdav>Проверить</button>
               </div>
             </div>
           </form>
         </section>
         `,
         "Настройки",
-        "Каталог для архивных мониторингов",
+        "Корень, архив и группа доступа",
       )
     }
 
@@ -965,6 +979,7 @@
       if (!data.selected_org_types && form.dataset.form === "campaign") data.selected_org_types = []
       if (data.allowed_extensions) data.allowed_extensions = String(data.allowed_extensions).split(",").map((item) => item.trim()).filter(Boolean)
       if (data.default_extensions) data.default_extensions = String(data.default_extensions).split(",").map((item) => item.trim()).filter(Boolean)
+      if (form.dataset.form === "settings") data.collaboration_group = form.elements.collaboration_group?.value.trim() || ""
       if (form.dataset.form === "organization") {
         data.email = form.elements.email.value.trim() || null
         const aliases = form.elements.aliases.value.split(/[;,]/).map((item) => item.trim()).filter(Boolean)
@@ -1198,6 +1213,16 @@
         } else if (target.dataset.pickFolder !== undefined) {
           const input = target.closest(".mrm-input-action")?.querySelector("input")
           openFolderPicker({ onPick: (value) => setPickedFolder(value, input) })
+        } else if (target.dataset.testWebdav !== undefined) {
+          const result = await api("/settings/test-webdav", { method: "POST" })
+          const mode = result.mode === "team_folder"
+            ? "Team Folder"
+            : result.mode === "group_share_fallback"
+              ? "fallback с группой"
+              : result.mode === "received_share"
+                ? "общая папка"
+                : "папка владельца"
+          setNotice(`Корень доступен: ${mode}`)
         } else if (target.dataset.download) {
           await download(target.dataset.download)
         } else if (target.dataset.op) {
