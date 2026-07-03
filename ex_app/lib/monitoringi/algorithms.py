@@ -9,12 +9,21 @@ from pathlib import PurePosixPath
 from typing import Any, Iterable, Protocol
 
 FORBIDDEN_EXTENSIONS = {"exe", "bat", "cmd", "com", "js", "jse", "vbs", "sh", "ps1", "msi", "scr"}
-PREFIXES = ("ГБОУ", "ДОУ", "ОДО")
+DEFAULT_ORGANIZATION_ALIASES = {
+    "school": ["ГБОУ"],
+    "kindergarten": ["ДОУ"],
+    "odo": ["ОДО"],
+    "udod": ["ЦФКСиЗ", "ДДЮТ", "ЦДЮТТ", "ЦППМСП", "ИМЦ"],
+}
 
 _MULTI_SPACES = re.compile(r"\s+")
 _COPY_SUFFIX = re.compile(r"\s*\(\d+\)\s*$")
-_PREFIX_WITHOUT_SPACE = re.compile(r"(?iu)\b(ГБОУ|ДОУ|ОДО)\s*(?=[^\W_])")
-_PREFIX_CODE = re.compile(r"(?iu)^(ГБОУ|ДОУ|ОДО)\s+(.+?)(?:\s|_|-|\.|$)")
+_PREFIX_PATTERN = "|".join(
+    re.escape(alias)
+    for aliases in DEFAULT_ORGANIZATION_ALIASES.values()
+    for alias in sorted(aliases, key=len, reverse=True)
+)
+_PREFIX_WITHOUT_SPACE = re.compile(rf"(?iu)\b({_PREFIX_PATTERN})\s*(?=[^\W_])")
 
 
 class OrganizationLike(Protocol):
@@ -124,6 +133,84 @@ def _get_org_value(org: OrganizationLike | dict[str, Any], key: str, default: An
     return getattr(org, key, default)
 
 
+def _organization_type_key(value: Any) -> str:
+    raw = value.value if hasattr(value, "value") else value
+    text = str(raw or "").strip()
+    if "." in text:
+        text = text.rsplit(".", 1)[-1]
+    return text
+
+
+def default_organization_aliases(org_type: Any) -> list[str]:
+    return list(DEFAULT_ORGANIZATION_ALIASES.get(_organization_type_key(org_type), []))
+
+
+def _dedupe_values(values: Iterable[Any]) -> list[str]:
+    result: list[str] = []
+    seen: set[str] = set()
+    for value in values:
+        text = str(value or "").strip()
+        key = normalize_text(text) if text else ""
+        if not text or key in seen:
+            continue
+        seen.add(key)
+        result.append(text)
+    return result
+
+
+def effective_organization_aliases(org: OrganizationLike | dict[str, Any]) -> list[str]:
+    return _dedupe_values(
+        [
+            *default_organization_aliases(_get_org_value(org, "type")),
+            _get_org_value(org, "prefix"),
+            *(_get_org_value(org, "aliases", []) or []),
+        ]
+    )
+
+
+def _alias_contains_code(alias: str, code: str) -> bool:
+    alias_norm = normalize_text(alias)
+    code_norm = normalize_text(code)
+    return bool(code_norm and re.search(rf"(^|[\s_.-]){re.escape(code_norm)}($|[\s_.-])", alias_norm))
+
+
+def _alias_code_prefix_match(base: str, alias: str, code: str) -> bool:
+    alias_norm = normalize_text(alias)
+    code_norm = normalize_text(code)
+    if not alias_norm or not code_norm:
+        return False
+    pattern = re.compile(rf"^{re.escape(alias_norm)}[\s_.-]*{re.escape(code_norm)}(?=$|[\s_.-])", re.IGNORECASE)
+    return bool(pattern.search(base))
+
+
+def _canonical_alias(org: OrganizationLike | dict[str, Any], matched_alias: str | None = None) -> str:
+    code = str(_get_org_value(org, "code", ""))
+    aliases = effective_organization_aliases(org)
+    if matched_alias and not _alias_contains_code(matched_alias, code):
+        return matched_alias.strip()
+    for alias in aliases:
+        if not _alias_contains_code(alias, code):
+            return alias
+    return str(_get_org_value(org, "prefix") or "").strip()
+
+
+def normalized_organization_file_stem(org: OrganizationLike | dict[str, Any], matched_alias: str | None = None) -> str:
+    code = str(_get_org_value(org, "code", "")).strip()
+    alias = _canonical_alias(org, matched_alias)
+    if alias and code:
+        return _MULTI_SPACES.sub(" ", f"{alias} {code}").strip()
+    return str(_get_org_value(org, "display_name") or code).strip()
+
+
+def normalized_organization_filename(
+    org: OrganizationLike | dict[str, Any],
+    current_name: str,
+    matched_alias: str | None = None,
+) -> str:
+    _stem, suffix = split_name(current_name)
+    return f"{normalized_organization_file_stem(org, matched_alias)}{suffix}"
+
+
 def _boundary_prefix_match(base: str, token: str) -> bool:
     token_norm = normalize_text(token)
     if not token_norm:
@@ -139,31 +226,39 @@ def extract_organization(
     normalized = normalize_filename(filename).normalized_name
     base = normalize_text(split_name(normalized)[0])
     matches: set[str] = set()
-
-    prefix_match = _PREFIX_CODE.search(base)
-    parsed_prefix = prefix_match.group(1).casefold() if prefix_match else None
-    parsed_code = normalize_text(prefix_match.group(2)) if prefix_match else None
+    matched_aliases: dict[str, str | None] = {}
+    org_by_id: dict[str, OrganizationLike | dict[str, Any]] = {}
 
     for org in organizations:
         if not _get_org_value(org, "active", True):
             continue
         org_id = str(_get_org_value(org, "id"))
-        prefix = _get_org_value(org, "prefix")
+        org_by_id[org_id] = org
         code = str(_get_org_value(org, "code", ""))
         display_name = str(_get_org_value(org, "display_name", ""))
-        aliases = _get_org_value(org, "aliases", []) or []
+        aliases = effective_organization_aliases(org)
 
-        if prefix and parsed_prefix == normalize_text(prefix) and parsed_code == normalize_text(code):
+        matched_alias = next((alias for alias in aliases if _alias_code_prefix_match(base, alias, code)), None)
+        if matched_alias:
             matches.add(org_id)
+            matched_aliases[org_id] = matched_alias
             continue
 
-        tokens = [display_name, code, *aliases]
+        explicit_aliases = [alias for alias in aliases if _alias_contains_code(alias, code)]
+        tokens = [display_name, code, *explicit_aliases]
         if any(_boundary_prefix_match(base, token) for token in tokens):
             matches.add(org_id)
+            matched_aliases[org_id] = None
 
     ordered = sorted(matches)
     if len(ordered) == 1:
-        return OrganizationMatch("matched", ordered[0], ordered, normalized)
+        org_id = ordered[0]
+        return OrganizationMatch(
+            "matched",
+            org_id,
+            ordered,
+            normalized_organization_filename(org_by_id[org_id], normalized, matched_aliases.get(org_id)),
+        )
     if len(ordered) > 1:
         return OrganizationMatch("ambiguous", None, ordered, normalized, "ambiguous_match")
     return OrganizationMatch("unknown", None, [], normalized, "unknown_organization")

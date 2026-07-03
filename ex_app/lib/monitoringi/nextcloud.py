@@ -16,7 +16,7 @@ from .config import SETTINGS
 from .errors import NextcloudApiError
 from .security import ensure_under_root, normalize_nc_path
 
-DAV_NS = {"d": "DAV:", "nc": "http://nextcloud.org/ns"}
+DAV_NS = {"d": "DAV:", "nc": "http://nextcloud.org/ns", "oc": "http://owncloud.org/ns"}
 
 
 @dataclass(frozen=True)
@@ -40,6 +40,7 @@ class WebDAVEntry:
     mtime: datetime | None
     mime_type: str | None
     etag: str | None = None
+    file_id: str | None = None
 
 
 def configured_credentials(overrides: dict | None = None) -> NextcloudCredentials:
@@ -81,6 +82,15 @@ def configured_credentials(overrides: dict | None = None) -> NextcloudCredential
 
 def _quote_path(path: str) -> str:
     return "/".join(quote(part, safe="") for part in normalize_nc_path(path).split("/") if part)
+
+
+def _mail_bridge_token() -> str | None:
+    token_path = SETTINGS.storage_dir / "mail_bridge_token"
+    try:
+        token = token_path.read_text(encoding="utf-8").strip()
+    except OSError:
+        return None
+    return token or None
 
 
 def _parse_http_date(value: str | None) -> datetime | None:
@@ -141,13 +151,15 @@ class NextcloudClient:
             self._dav_url(path),
             headers={"Depth": str(depth), "Content-Type": "application/xml"},
             content="""<?xml version="1.0"?>
-<d:propfind xmlns:d="DAV:" xmlns:nc="http://nextcloud.org/ns">
+<d:propfind xmlns:d="DAV:" xmlns:nc="http://nextcloud.org/ns" xmlns:oc="http://owncloud.org/ns">
   <d:prop>
     <d:resourcetype/>
     <d:getcontentlength/>
     <d:getlastmodified/>
     <d:getcontenttype/>
     <d:getetag/>
+    <oc:fileid/>
+    <nc:fileid/>
   </d:prop>
 </d:propfind>""",
         )
@@ -174,6 +186,7 @@ class NextcloudClient:
             mime_type = prop.findtext("d:getcontenttype", default=None, namespaces=DAV_NS)
             modified = prop.findtext("d:getlastmodified", default=None, namespaces=DAV_NS)
             etag = prop.findtext("d:getetag", default=None, namespaces=DAV_NS)
+            file_id = prop.findtext("oc:fileid", default=None, namespaces=DAV_NS) or prop.findtext("nc:fileid", default=None, namespaces=DAV_NS)
             result.append(
                 WebDAVEntry(
                     path=normalize_nc_path(path),
@@ -183,6 +196,7 @@ class NextcloudClient:
                     mtime=_parse_http_date(modified),
                     mime_type=mime_type,
                     etag=etag,
+                    file_id=str(file_id) if file_id else None,
                 )
             )
         return result
@@ -294,6 +308,48 @@ class NextcloudClient:
             "public_link": data.get("url"),
             "token": data.get("token"),
         }
+
+    async def delete_public_share(self, share_id: str) -> None:
+        share_id = str(share_id or "").strip()
+        if not share_id:
+            return
+        response = await self._client.delete(
+            f"/ocs/v2.php/apps/files_sharing/api/v1/shares/{quote(share_id, safe='')}",
+            params={"format": "json"},
+            headers={"OCS-APIRequest": "true", "Accept": "application/json"},
+        )
+        if response.status_code == 404:
+            return
+        if response.status_code in {401, 403}:
+            raise NextcloudApiError("SHARE_API_FORBIDDEN", "Нет прав на удаление публичной ссылки.", response.status_code)
+        if response.status_code >= 400:
+            raise NextcloudApiError("SHARE_DELETE_FAILED", "Не удалось удалить публичную ссылку.", 502, response.text)
+        if response.status_code in {202, 204}:
+            return
+        try:
+            payload = response.json().get("ocs", {})
+        except ValueError:
+            return
+        meta = payload.get("meta", {})
+        status_code = int(meta.get("statuscode") or 100)
+        if status_code in {100, 200, 404}:
+            return
+        if status_code >= 400 and status_code != 404:
+            raise NextcloudApiError("SHARE_DELETE_FAILED", str(meta.get("message") or "Не удалось удалить публичную ссылку."), 502)
+
+    async def send_service_mail(self, *, to_email: str, subject: str, body: str) -> None:
+        token = _mail_bridge_token()
+        if not token:
+            raise NextcloudApiError("MAIL_BRIDGE_TOKEN_MISSING", "?? ???????? bridge-????? ????????? ????? Nextcloud.", 500)
+        response = await self._client.post(
+            "/oo_file_collector_mail_bridge.php",
+            json={"to": to_email, "subject": subject, "body": body},
+            headers={"X-OO-File-Collector-Token": token},
+        )
+        if response.status_code in {200, 201, 202, 204}:
+            return
+        raise NextcloudApiError("NEXTCLOUD_MAIL_SEND_FAILED", "Nextcloud ?? ???????? ?????? ????? ????????? ?????.", 502, response.text)
+
 
     async def test_webdav(self) -> dict[str, str | int]:
         entries = await self.propfind(self.credentials.root_path, depth=0)

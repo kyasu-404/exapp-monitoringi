@@ -85,6 +85,15 @@ class OperationItemStatus(str, Enum):
     failed = "failed"
 
 
+class MailItemStatus(str, Enum):
+    pending = "pending"
+    sending = "sending"
+    sent = "sent"
+    failed = "failed"
+    bounced = "bounced"
+    unknown = "unknown"
+
+
 class Organization(SQLModel, table=True):
     id: str = Field(default_factory=new_id, primary_key=True)
     type: OrganizationType = Field(index=True)
@@ -149,6 +158,45 @@ class FileRecord(SQLModel, table=True):
     checksum: str | None = None
     classification: FileClassification = Field(index=True)
     reason: str | None = None
+    created_at: datetime = Field(default_factory=utcnow)
+    updated_at: datetime = Field(default_factory=utcnow)
+
+
+class CheckResult(SQLModel, table=True):
+    id: str = Field(default_factory=new_id, primary_key=True)
+    campaign_id: str = Field(index=True, foreign_key="campaign.id")
+    operation_batch_id: str | None = Field(default=None, index=True, foreign_key="operationbatch.id")
+    summary_json: dict[str, Any] = Field(default_factory=dict, sa_column=Column(SAJSON))
+    created_by: str | None = None
+    created_at: datetime = Field(default_factory=utcnow)
+
+
+class MessageBatch(SQLModel, table=True):
+    id: str = Field(default_factory=new_id, primary_key=True)
+    campaign_id: str = Field(index=True, foreign_key="campaign.id")
+    check_result_id: str = Field(index=True, foreign_key="checkresult.id")
+    status: BatchStatus = Field(default=BatchStatus.preview, index=True)
+    created_by: str | None = None
+    created_at: datetime = Field(default_factory=utcnow)
+    queued_at: datetime | None = None
+    finished_at: datetime | None = None
+    summary_json: dict[str, Any] = Field(default_factory=dict, sa_column=Column(SAJSON))
+
+
+class MessageItem(SQLModel, table=True):
+    id: str = Field(default_factory=new_id, primary_key=True)
+    batch_id: str = Field(index=True, foreign_key="messagebatch.id")
+    campaign_id: str = Field(index=True, foreign_key="campaign.id")
+    check_result_id: str = Field(index=True, foreign_key="checkresult.id")
+    organization_id: str | None = Field(default=None, index=True, foreign_key="organization.id")
+    to_email: str
+    extra_emails: list[str] = Field(default_factory=list, sa_column=Column(SAJSON))
+    subject: str
+    body: str
+    status: MailItemStatus = Field(default=MailItemStatus.pending, index=True)
+    attempts: int = 0
+    last_error: str | None = None
+    sent_at: datetime | None = None
     created_at: datetime = Field(default_factory=utcnow)
     updated_at: datetime = Field(default_factory=utcnow)
 

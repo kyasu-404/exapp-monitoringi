@@ -3,7 +3,7 @@ from datetime import date
 import pytest
 from sqlmodel import Session, SQLModel, create_engine, select
 
-from monitoringi.models import Campaign, CampaignOrganization, OperationItem, OperationItemStatus, Organization
+from monitoringi.models import Campaign, CampaignOrganization, CampaignOrganizationStatus, OperationItem, OperationItemStatus, Organization
 from monitoringi.reports import link_rows, mailing_rows, render_template
 from monitoringi.services import apply_batch, create_batch, parse_organization_table, planned_folder_items
 
@@ -35,6 +35,23 @@ def test_import_organizations_csv_cp1251():
             "notes": None,
         }
     ]
+
+
+def test_organization_type_aliases_support_model_enum_values():
+    from monitoringi.models import OrganizationType
+    from monitoringi.services import organization_type_aliases
+
+    assert organization_type_aliases(OrganizationType.kindergarten) == ["\u0414\u041e\u0423"]
+    assert organization_type_aliases(OrganizationType.odo) == ["\u041e\u0414\u041e"]
+
+
+def test_import_organizations_adds_default_aliases_when_missing():
+    content = "\u0422\u0438\u043f \u041e\u0423;\u041d\u043e\u043c\u0435\u0440;Email\n\u0421\u0430\u0434\u044b;222;garden@example.test\n".encode("cp1251")
+
+    rows = parse_organization_table("orgs.csv", content)
+
+    assert rows[0]["type"] == "kindergarten"
+    assert rows[0]["aliases"] == ["\u0414\u041e\u0423"]
 
 
 def test_generate_mail_template():
@@ -75,6 +92,8 @@ def test_planned_folder_items_single_type_creates_organization_code_folders_only
                 "organization_id": "org-42",
                 "organization_code": "42",
                 "organization_name": "ГБОУ 42",
+                "organization_type": "school",
+                "organization_type_folder": "Школы",
             },
         }
     ]
@@ -122,6 +141,50 @@ def test_planned_folder_items_multiple_types_creates_type_sections():
         "organization_folder",
         "organization_folder",
     ]
+
+
+def test_planned_folder_items_rechecks_existing_webdav_folders():
+    campaign = Campaign(
+        id="campaign-777",
+        title="777",
+        date=date(2026, 7, 2),
+        parent_nc_path="/Мониторинги",
+        campaign_folder_path="/Мониторинги/777",
+        selected_org_types=["school", "kindergarten"],
+    )
+    organizations = [
+        Organization(id="org-school", type="school", code="42", display_name="ГБОУ 42"),
+        Organization(id="org-kindergarten", type="kindergarten", code="8", display_name="ГБДОУ 8"),
+    ]
+    campaign_orgs = [
+        CampaignOrganization(
+            id="campaign-org-school",
+            campaign_id=campaign.id,
+            organization_id="org-school",
+            folder_path="/Мониторинги/777/Школы/42",
+            status=CampaignOrganizationStatus.folder_created,
+        ),
+        CampaignOrganization(
+            id="campaign-org-kindergarten",
+            campaign_id=campaign.id,
+            organization_id="org-kindergarten",
+            folder_path="/Мониторинги/777/Сады/8",
+            status=CampaignOrganizationStatus.folder_created,
+        ),
+    ]
+
+    items = planned_folder_items(
+        campaign,
+        campaign_orgs,
+        organizations,
+        existing_folder_paths={"/Мониторинги/777", "/Мониторинги/777/Школы", "/Мониторинги/777/Сады"},
+    )
+
+    assert [item["target_path"] for item in items] == [
+        "/Мониторинги/777/Школы/42",
+        "/Мониторинги/777/Сады/8",
+    ]
+    assert all(item["reason"] == "organization_folder" for item in items)
 
 
 def test_link_and_mailing_rows_use_type_sections():

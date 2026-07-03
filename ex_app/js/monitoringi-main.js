@@ -1,18 +1,23 @@
 (function () {
   function boot() {
+    const storedRenameTemplate = window.localStorage?.getItem("mrmRenameTemplate") || ""
+    const activeRenameTemplate = storedRenameTemplate && storedRenameTemplate !== "ГБДОУ {номер} отчёт" ? storedRenameTemplate : "текст {алиас} {номер} текст"
     const state = {
       view: "dashboard",
       organizations: [],
       campaigns: [],
+      recentUploads: [],
       settings: {},
       selectedCampaignId: "",
       editingOrganizationId: "",
       editingCampaignId: "",
       organizationFilter: "all",
       fileIds: new URLSearchParams(window.location.search).get("fileIds") || "",
+      contextChecked: false,
       lastBatch: null,
       operationBatches: {},
-      renameTemplate: window.localStorage?.getItem("mrmRenameTemplate") || "",
+      operationState: {},
+      renameTemplate: activeRenameTemplate,
     }
 
     const organizationTypes = [
@@ -22,11 +27,19 @@
       ["udod", "УДОДы"],
     ]
 
+    const defaultOrganizationAliases = {
+      school: ["ГБОУ"],
+      kindergarten: ["ДОУ"],
+      odo: ["ОДО"],
+      udod: ["ЦФКСиЗ", "ДДЮТ", "ЦДЮТТ", "ЦППМСП", "ИМЦ"],
+    }
+
     const views = [
       ["dashboard", "1", "Справка"],
       ["organizations", "2", "Список ОУ"],
       ["campaigns", "3", "Мониторинги"],
       ["operations", "4", "Операции"],
+      ["settings", "5", "Настройки"],
     ]
 
     const DIRECTORY_MIME_TYPE = "httpd/unix-directory"
@@ -165,19 +178,33 @@
 
     async function loadBase() {
       try {
-        const [organizations, campaigns, settings] = await Promise.all([
+        const [organizations, campaigns, settings, recentUploads] = await Promise.all([
           api("/organizations?active=true"),
           api("/campaigns"),
           api("/settings"),
+          api("/recent-uploads?limit=10").catch(() => []),
         ])
         state.organizations = organizations
         state.campaigns = campaigns
         state.settings = settings
+        state.recentUploads = recentUploads
         const previousCampaignId = state.selectedCampaignId
         if (!campaigns.some((campaign) => campaign.id === state.selectedCampaignId)) {
           state.selectedCampaignId = campaigns[0]?.id || ""
         }
         if (previousCampaignId !== state.selectedCampaignId) state.operationBatches = {}
+        state.operationState = state.selectedCampaignId ? await api(`/campaigns/${state.selectedCampaignId}/operation-state`).catch(() => ({})) : {}
+        if (state.fileIds && !state.contextChecked) {
+          state.contextChecked = true
+          const context = await api(`/context-folder?file_ids=${encodeURIComponent(state.fileIds)}`)
+          if (context.is_monitoring && context.campaign?.id) {
+            state.selectedCampaignId = context.campaign.id
+            state.view = "operations"
+          } else {
+            state.view = "dashboard"
+            setNotice("Данный каталог не является мониторингом", true)
+          }
+        }
         render()
       } catch (error) {
         setNotice(error.message, true)
@@ -194,6 +221,40 @@
 
     function typeLabel(value) {
       return organizationTypes.find(([id]) => id === value)?.[1] || String(value || "")
+    }
+
+    function defaultAliasesForType(value) {
+      return defaultOrganizationAliases[value] || []
+    }
+
+    function aliasText(value) {
+      return (value || []).join(", ")
+    }
+
+    function isDefaultAliasText(value) {
+      const normalized = String(value || "").trim()
+      return Object.values(defaultOrganizationAliases).some((aliases) => aliasText(aliases) === normalized)
+    }
+
+    function formatDateTime(value) {
+      if (!value) return ""
+      const date = new Date(value)
+      if (Number.isNaN(date.getTime())) return String(value)
+      return date.toLocaleString("ru-RU", {
+        day: "2-digit",
+        month: "2-digit",
+        year: "numeric",
+        hour: "2-digit",
+        minute: "2-digit",
+      })
+    }
+
+    function formatSize(value) {
+      const size = Number(value || 0)
+      if (!size) return ""
+      if (size < 1024) return `${size} Б`
+      if (size < 1024 * 1024) return `${Math.round(size / 1024)} КБ`
+      return `${(size / 1024 / 1024).toFixed(1)} МБ`
     }
 
     function orgTypeOptions(selected = "school") {
@@ -253,14 +314,15 @@
       return typeof path === "string" && path ? (path.startsWith("/") ? path : `/${path}`) : ""
     }
 
-    function setPickedFolder(value) {
+    function setPickedFolder(value, input = null) {
       const path = selectedPickerPath(value)
       if (!path) {
         setNotice("Не удалось определить выбранную папку", true)
         return
       }
-      const input = root.querySelector('[name="parent_nc_path"]')
-      if (input) input.value = path
+      const targetInput = input || root.querySelector('[name="parent_nc_path"]')
+      if (targetInput) targetInput.value = path
+      return path
     }
 
     function legacyDialogs() {
@@ -272,17 +334,20 @@
       return null
     }
 
-    function openFolderPicker() {
+    function openFolderPicker({ title = "Выберите папку", onPick = setPickedFolder } = {}) {
+      const pick = (value) => {
+        Promise.resolve(onPick(value)).catch((error) => setNotice(error.message, true))
+      }
       const builderFactory = nextcloudFilePickerBuilderFactory()
       if (typeof builderFactory === "function") {
         try {
-          const builder = builderFactory("Выберите папку")
+          const builder = builderFactory(title)
           builder.addMimeTypeFilter?.(DIRECTORY_MIME_TYPE)
           builder.setFilter?.((node) => isPickerDirectory(node))
           builder.setCanPick?.((node) => isPickerDirectory(node))
           builder.allowDirectories?.(true)
           builder.setMultiSelect?.(false)
-          builder.build().pick().then(setPickedFolder).catch(() => {})
+          builder.build().pick().then(pick).catch(() => {})
           return
         } catch (error) {
           console.warn("Nextcloud folder picker builder failed:", error)
@@ -291,7 +356,7 @@
 
       const dialogs = legacyDialogs()
       if (dialogs) {
-        dialogs.filepicker("Выберите папку", setPickedFolder, false, [DIRECTORY_MIME_TYPE], true)
+        dialogs.filepicker(title, pick, false, [DIRECTORY_MIME_TYPE], true)
         return
       }
 
@@ -529,7 +594,7 @@
     function dashboard() {
       const active = state.campaigns.filter((item) => ["active", "links_created", "folders_created"].includes(item.status)).length
       const orgsWithoutEmail = state.organizations.filter((item) => !item.email).length
-      const latest = state.campaigns.slice(0, 8)
+      const latestUploads = state.recentUploads || []
       const nextStep = state.organizations.length === 0
         ? "Заполните список ОУ"
         : state.campaigns.length === 0
@@ -555,16 +620,23 @@
           <div class="mrm-stat"><strong>${state.organizations.length}</strong><span>Количество ОУ</span></div>
           <div class="mrm-stat"><strong>${orgsWithoutEmail}</strong><span>Без email</span></div>
           <div class="mrm-panel">
-            <div class="mrm-panel-header"><h3>Последние мониторинги</h3></div>
+            <div class="mrm-panel-header"><h3>Последние загруженные файлы</h3></div>
             <div class="mrm-table-wrap">
               <table class="mrm-table">
-                <thead><tr><th>Название</th><th>Папка</th><th>Статус</th></tr></thead>
+                <thead><tr><th>Файл</th><th>Куда загружен</th><th>Папка</th><th>Когда</th></tr></thead>
                 <tbody>
-                  ${latest
+                  ${latestUploads
                     .map(
-                      (item) => `<tr><td>${h(item.title)}</td><td class="is-wrap">${h(item.campaign_folder_path)}</td><td>${statusPill(item.status)}</td></tr>`,
+                      (item) => `
+                        <tr>
+                          <td class="is-wrap">${h(item.name)}${item.size ? `<span class="mrm-muted-inline">${h(formatSize(item.size))}</span>` : ""}</td>
+                          <td>${h([item.campaign_title, item.organization_name].filter(Boolean).join(" / "))}</td>
+                          <td class="is-wrap">${h(item.folder_path)}</td>
+                          <td>${h(formatDateTime(item.uploaded_at))}</td>
+                        </tr>
+                      `,
                     )
-                    .join("") || `<tr><td colspan="3">Нет мониторингов</td></tr>`}
+                    .join("") || `<tr><td colspan="4">Загруженных файлов пока нет</td></tr>`}
                 </tbody>
               </table>
             </div>
@@ -584,6 +656,7 @@
               <td>${h(typeLabel(item.type))}</td>
               <td>${h(item.code)}</td>
               <td>${h(item.email)}</td>
+              <td>${h(aliasText(item.aliases))}</td>
               <td class="mrm-row-actions">
                 <button class="mrm-button compact" type="button" data-edit-organization="${h(item.id)}">Изменить</button>
                 <button class="mrm-button compact danger" type="button" data-delete-organization="${h(item.id)}">Удалить</button>
@@ -608,7 +681,7 @@
             <div class="mrm-fields">
               <div class="mrm-field">
                 <label>Тип ОУ *</label>
-                <select name="type" required>${orgTypeOptions(editing?.type || "school")}</select>
+                <select name="type" data-org-type-select required>${orgTypeOptions(editing?.type || "school")}</select>
               </div>
               <div class="mrm-field">
                 <label>Номер *</label>
@@ -617,6 +690,10 @@
               <div class="mrm-field">
                 <label>Email</label>
                 <input name="email" type="email" value="${h(editing?.email)}">
+              </div>
+              <div class="mrm-field">
+                <label>Алиасы</label>
+                <input name="aliases" data-org-aliases value="${h(aliasText(editing?.aliases || defaultAliasesForType(editing?.type || "school")))}">
               </div>
               <div class="mrm-form-actions">
                 <button class="mrm-button primary" type="submit">${editing ? "Сохранить" : "Добавить"}</button>
@@ -639,14 +716,14 @@
                     .map(([value, label]) => `<button class="${state.organizationFilter === value ? "is-active" : ""}" type="button" data-org-filter="${h(value)}">${h(label)}</button>`)
                     .join("")}
                 </div>
-                <p class="mrm-hint">Колонки для импорта: Тип ОУ, Номер, Email.</p>
+                <p class="mrm-hint">Колонки для импорта: Тип ОУ, Номер, Email, Алиасы.</p>
               </div>
             </div>
             <div class="mrm-table-wrap">
               <table class="mrm-table">
-                <thead><tr><th>Тип ОУ</th><th>Номер</th><th>Email</th><th></th></tr></thead>
+                <thead><tr><th>Тип ОУ</th><th>Номер</th><th>Email</th><th>Алиасы</th><th></th></tr></thead>
                 <tbody>
-                  ${organizationRows(visibleOrganizations) || `<tr><td colspan="4">Записей нет</td></tr>`}
+                  ${organizationRows(visibleOrganizations) || `<tr><td colspan="5">Записей нет</td></tr>`}
                 </tbody>
               </table>
             </div>
@@ -694,7 +771,7 @@
             </div>
             <div class="mrm-table-wrap">
               <table class="mrm-table">
-                <thead><tr><th>Название</th><th>Папка</th><th>Типы ОУ</th><th>Статус</th><th></th></tr></thead>
+                <thead><tr><th>Название</th><th>Папка</th><th>Типы ОУ</th><th>Расширения</th><th></th></tr></thead>
                 <tbody>
                   ${state.campaigns
                     .map(
@@ -703,10 +780,12 @@
                           <td>${h(item.title)}</td>
                           <td class="is-wrap">${h(item.campaign_folder_path)}</td>
                           <td>${h((item.selected_org_types || []).map(typeLabel).join(", "))}</td>
-                          <td>${statusPill(item.status)}</td>
+                          <td>${h((item.allowed_extensions || []).join(", "))}</td>
                           <td class="mrm-row-actions">
                             <button class="mrm-button compact" type="button" data-edit-campaign="${h(item.id)}">Изменить</button>
+                            <button class="mrm-button compact" type="button" data-move-campaign="${h(item.id)}">Переместить</button>
                             <button class="mrm-button compact" type="button" data-select-campaign="${h(item.id)}">Выбрать</button>
+                            <button class="mrm-button compact danger" type="button" data-archive-campaign="${h(item.id)}">В архив</button>
                           </td>
                         </tr>
                       `,
@@ -721,6 +800,79 @@
         "Мониторинги",
         "Главный каталог, в котором будут выполняться массовые операции, проверки и рассылки для ОУ из списка",
       )
+    }
+
+    function settings() {
+      const archiveFolder = state.settings.archive_folder || ""
+      return shell(
+        `
+        <section class="mrm-grid">
+          <form class="mrm-form" data-form="settings">
+            <h3>Настройки</h3>
+            <div class="mrm-fields">
+              <div class="mrm-field">
+                <label>Каталог архива</label>
+                <div class="mrm-input-action">
+                  <input name="archive_folder" value="${h(archiveFolder)}" required>
+                  <button class="mrm-button" type="button" data-pick-folder>Выбрать</button>
+                </div>
+              </div>
+              <div class="mrm-form-actions">
+                <button class="mrm-button primary" type="submit">Сохранить</button>
+              </div>
+            </div>
+          </form>
+        </section>
+        `,
+        "Настройки",
+        "Каталог для архивных мониторингов",
+      )
+    }
+
+    function checkSummaryText(summary = {}) {
+      return `Файлов найдено: ${summary.total || 0}; Корректных: ${summary.valid || 0}; Дублей: ${summary.duplicate || 0}; Неподходящих: ${(summary.invalid_extension || 0) + (summary.invalid_name || 0) + (summary.unknown || 0)}; Не предоставили: ${summary.missing || 0}`
+    }
+
+    function messagesCard() {
+      const check = state.operationState.check_result
+      const summary = state.operationState.check_summary || {}
+      const batch = state.operationState.message_batch
+      if (!check) {
+        return `
+          <div class="mrm-op-card is-disabled">
+            <span>Сообщения</span>
+            <strong>Сформировать письма и список не предоставивших</strong>
+            <p>Сначала выполните и сохраните проверку файлов.</p>
+            <div class="mrm-actions"><button class="mrm-button" type="button" disabled>Сформировать</button></div>
+          </div>
+        `
+      }
+      if (batch) {
+        return `
+          <div class="mrm-op-card">
+            <span>Сообщения</span>
+            <strong>Сообщения сформированы: ${h(batch.summary_json?.planned || batch.summary_json?.pending || 0)}</strong>
+            <p>Источник: проверка от ${h(formatDateTime(check.created_at))}</p>
+            <div class="mrm-actions">
+              <button class="mrm-button" type="button" data-download="messages.xlsx:${h(batch.id)}">Скачать XLSX</button>
+              <button class="mrm-button" type="button" data-download="messages.txt:${h(batch.id)}">Скачать TXT</button>
+              <button class="mrm-button" type="button" data-op="messages-open">Открыть письма</button>
+              <button class="mrm-button primary" type="button" data-op="messages-send">Отправить / Подготовить рассылку</button>
+            </div>
+          </div>
+        `
+      }
+      return `
+        <div class="mrm-op-card">
+          <span>Сообщения</span>
+          <strong>Сформировать письма и список не предоставивших</strong>
+          <p>Будут сформированы письма по результату проверки от ${h(formatDateTime(check.created_at))}. ${h(checkSummaryText(summary))}</p>
+          <div class="mrm-actions">
+            <button class="mrm-button" type="button" data-op="messages-preview">Preview</button>
+            <button class="mrm-button primary" type="button" data-op="messages-prepare">Сформировать сообщения</button>
+          </div>
+        </div>
+      `
     }
 
     function operations() {
@@ -755,13 +907,14 @@
                   <p>Переносит невалидные файлы в мусор и более старые копии в дубли, переименовывает актуальные файлы.</p>
                   <div class="mrm-actions"><button class="mrm-button" type="button" data-op="scan-preview">Проверить файлы</button><button class="mrm-button primary" type="button" data-op="scan-apply">Сохранить результат</button></div>
                 </div>
+                ${messagesCard()}
                 <div class="mrm-op-card">
                   <span>Массовые операции</span>
                   <strong>Переименование</strong>
                   <p>Меняйте массово имена для загруженных файлов по заданному вами шаблону.</p>
                   <div class="mrm-field">
                     <label>Шаблон имени</label>
-                    <input data-rename-template value="${h(state.renameTemplate)}" placeholder="ГБДОУ {номер} отчёт">
+                    <input data-rename-template value="${h(state.renameTemplate)}" placeholder="текст {алиас} {номер} текст">
                   </div>
                   <div class="mrm-actions">
                     <button class="mrm-button" type="button" data-op="rename-preview">Preview</button>
@@ -790,7 +943,7 @@
     }
 
     function render() {
-      const map = { dashboard, organizations, campaigns, operations }
+      const map = { dashboard, organizations, campaigns, operations, settings }
       const view = map[state.view] || dashboard
       root.innerHTML = view()
     }
@@ -814,6 +967,8 @@
       if (data.default_extensions) data.default_extensions = String(data.default_extensions).split(",").map((item) => item.trim()).filter(Boolean)
       if (form.dataset.form === "organization") {
         data.email = form.elements.email.value.trim() || null
+        const aliases = form.elements.aliases.value.split(/[;,]/).map((item) => item.trim()).filter(Boolean)
+        if (aliases.length) data.aliases = aliases
         if (data.code) data.display_name = data.code
       }
       return data
@@ -831,6 +986,8 @@
         .replace("campaign-links.xlsx", `campaigns/${state.selectedCampaignId}/links.xlsx`)
         .replace("campaign-report.xlsx", `campaigns/${state.selectedCampaignId}/report.xlsx`)
         .replace("campaign-message.txt", `campaigns/${state.selectedCampaignId}/message.txt`)
+        .replace(/^messages\.xlsx:(.+)$/u, "message-batches/$1/xlsx")
+        .replace(/^messages\.txt:(.+)$/u, "message-batches/$1/txt")
         .replace("organizations.xlsx", "organizations/export/xlsx")
       const response = await fetch(`${proxyBase}/api/${realPath}`)
       if (!response.ok) {
@@ -860,8 +1017,9 @@
       const withJson = (payload) => ({ body: JSON.stringify(payload) })
       const renamePayload = () => {
         const template = (root.querySelector("[data-rename-template]")?.value || state.renameTemplate || "").trim()
-        if (!template) throw new Error("Укажите шаблон имени файла. Например: ГБДОУ {номер} отчёт.")
+        if (!template) throw new Error("Укажите шаблон имени файла. Например: текст {алиас} {номер} текст.")
         if (!template.includes("{номер}")) throw new Error("Добавьте в шаблон {номер}, чтобы сохранить номер ОУ.")
+        if (!template.includes("{алиас}")) throw new Error("Добавьте в шаблон {алиас}, чтобы сохранить алиас ОУ.")
         state.renameTemplate = template
         window.localStorage?.setItem("mrmRenameTemplate", template)
         return { campaign_id: id, name_template: template }
@@ -905,6 +1063,30 @@
           path: `/campaigns/${id}/scan/apply`,
           options: {},
         },
+        "messages-preview": {
+          kind: "messages",
+          phase: "direct",
+          path: `/campaigns/${id}/messages/preview`,
+          options: {},
+        },
+        "messages-prepare": {
+          kind: "messages",
+          phase: "direct",
+          path: `/campaigns/${id}/messages/prepare`,
+          options: {},
+        },
+        "messages-send": {
+          kind: "messages",
+          phase: "direct",
+          path: () => `/message-batches/${encodeURIComponent(state.operationState.message_batch?.id || state.lastBatch?.message_batch_id || state.lastBatch?.batch_id || "")}/send`,
+          options: {},
+        },
+        "messages-open": {
+          kind: "messages",
+          phase: "direct",
+          path: () => `/message-batches/${encodeURIComponent(state.operationState.message_batch?.id || state.lastBatch?.message_batch_id || state.lastBatch?.batch_id || "")}`,
+          options: {},
+        },
         "rename-preview": {
           kind: "rename",
           phase: "preview",
@@ -940,6 +1122,40 @@
       render()
     }
 
+    async function moveCampaignWithPicker(campaignId) {
+      openFolderPicker({
+        title: "Выберите папку для перемещения мониторинга",
+        onPick: async (value) => {
+          const targetPath = selectedPickerPath(value)
+          if (!targetPath) throw new Error("Не удалось определить выбранную папку")
+          await api(`/campaigns/${encodeURIComponent(campaignId)}/move`, {
+            method: "POST",
+            body: JSON.stringify({ target_nc_path: targetPath }),
+          })
+          setNotice("Мониторинг перемещён")
+          await loadBase()
+          state.view = "campaigns"
+          render()
+        },
+      })
+    }
+
+    async function archiveCampaign(campaignId) {
+      const campaign = state.campaigns.find((item) => item.id === campaignId)
+      const title = campaign?.title ? ` «${campaign.title}»` : ""
+      if (!window.confirm(`Переместить мониторинг${title} в архив и удалить его публичные ссылки? Файлы останутся в папке архива.`)) return
+      await api(`/campaigns/${encodeURIComponent(campaignId)}/archive`, { method: "POST" })
+      if (state.selectedCampaignId === campaignId) {
+        state.selectedCampaignId = ""
+        state.operationBatches = {}
+      }
+      if (state.editingCampaignId === campaignId) state.editingCampaignId = ""
+      setNotice("Мониторинг перемещён в архив")
+      await loadBase()
+      state.view = "campaigns"
+      render()
+    }
+
     root.addEventListener("click", async (event) => {
       const target = event.target.closest("button")
       if (!target) return
@@ -963,6 +1179,10 @@
           state.editingCampaignId = target.dataset.editCampaign
           state.view = "campaigns"
           render()
+        } else if (target.dataset.moveCampaign) {
+          await moveCampaignWithPicker(target.dataset.moveCampaign)
+        } else if (target.dataset.archiveCampaign) {
+          await archiveCampaign(target.dataset.archiveCampaign)
         } else if (target.dataset.cancelCampaign !== undefined) {
           state.editingCampaignId = ""
           render()
@@ -976,7 +1196,8 @@
           setNotice("Запись удалена")
           await loadBase()
         } else if (target.dataset.pickFolder !== undefined) {
-          openFolderPicker()
+          const input = target.closest(".mrm-input-action")?.querySelector("input")
+          openFolderPicker({ onPick: (value) => setPickedFolder(value, input) })
         } else if (target.dataset.download) {
           await download(target.dataset.download)
         } else if (target.dataset.op) {
@@ -992,6 +1213,10 @@
         if (state.selectedCampaignId !== event.target.value) state.operationBatches = {}
         state.selectedCampaignId = event.target.value
         render()
+      }
+      if (event.target.matches("[data-org-type-select]")) {
+        const input = event.target.closest("form")?.querySelector("[data-org-aliases]")
+        if (input && (!input.value.trim() || isDefaultAliasText(input.value))) input.value = aliasText(defaultAliasesForType(event.target.value))
       }
       if (event.target.matches("[data-import-organizations]") && event.target.files[0]) {
         const file = event.target.files[0]
@@ -1049,6 +1274,10 @@
             await api("/campaigns", { method: "POST", body: JSON.stringify(payload) })
             setNotice("Мониторинг создан")
           }
+        } else if (form.dataset.form === "settings") {
+          const payload = jsonFromForm(form)
+          await api("/settings", { method: "PUT", body: JSON.stringify(payload) })
+          setNotice("Настройки сохранены")
         }
         form.reset()
         await loadBase()

@@ -11,7 +11,7 @@ from typing import Any
 from openpyxl import load_workbook
 from sqlmodel import Session, delete, select
 
-from .algorithms import FileCandidate, classify_files, extension_of, organization_sort_key, plan_renames
+from .algorithms import FileCandidate, classify_files, default_organization_aliases, extension_of, organization_sort_key, plan_renames
 from .config import SETTINGS
 from .models import (
     AuditLog,
@@ -73,8 +73,21 @@ ORGANIZATION_TYPE_ALIASES = {
 }
 
 
+def organization_type_aliases(value: Any) -> list[str]:
+    return default_organization_aliases(normalize_organization_type(value))
+
+
+def aliases_or_type_defaults(org_type: Any, aliases: list[Any] | None) -> list[str]:
+    cleaned = [str(item).strip() for item in aliases or [] if str(item).strip()]
+    return cleaned or organization_type_aliases(org_type)
+
+
 def normalize_organization_type(value: Any) -> str:
-    key = str(value or "school").strip().casefold()
+    raw = value.value if hasattr(value, "value") else value
+    key = str(raw or "school").strip()
+    if "." in key:
+        key = key.rsplit(".", 1)[-1]
+    key = key.casefold()
     normalized = ORGANIZATION_TYPE_ALIASES.get(key, key or "school")
     if normalized in ORGANIZATION_TYPE_LABELS or normalized == "other":
         return normalized
@@ -285,15 +298,17 @@ def _normalize_import_row(raw: dict[str, Any]) -> dict[str, Any] | None:
         return None
     code = code or display_name
     display_name = display_name or code
+    org_type = normalize_organization_type(raw.get("type"))
+    aliases = _split_list(raw.get("aliases"))
     return {
-        "type": normalize_organization_type(raw.get("type")),
+        "type": org_type,
         "prefix": str(raw.get("prefix") or "").strip() or None,
         "code": code,
         "display_name": display_name,
         "short_name": str(raw.get("short_name") or "").strip() or None,
         "email": str(raw.get("email") or "").strip() or None,
         "extra_emails": _split_list(raw.get("extra_emails")),
-        "aliases": _split_list(raw.get("aliases")),
+        "aliases": aliases_or_type_defaults(org_type, aliases),
         "active": _parse_bool(raw.get("active")),
         "notes": str(raw.get("notes") or "").strip() or None,
     }
@@ -484,6 +499,7 @@ def planned_folder_items(
     campaign: Campaign,
     campaign_orgs: list[CampaignOrganization],
     organizations: list[Organization] | None = None,
+    existing_folder_paths: set[str] | None = None,
 ) -> list[dict[str, Any]]:
     org_by_id = {org.id: org for org in organizations or []}
     items: list[dict[str, Any]] = []
@@ -491,10 +507,13 @@ def planned_folder_items(
     if use_type_folder:
         for type_value in campaign_type_values(campaign, organizations):
             type_folder = organization_type_label(type_value)
+            target_path = join_nc_path(campaign.campaign_folder_path, type_folder)
+            if existing_folder_paths is not None and target_path in existing_folder_paths:
+                continue
             items.append(
                 {
                     "action": "create_folder",
-                    "target_path": join_nc_path(campaign.campaign_folder_path, type_folder),
+                    "target_path": target_path,
                     "reason": "organization_type_folder",
                     "metadata_json": {"organization_type": type_value, "organization_type_folder": type_folder},
                 }
@@ -513,7 +532,20 @@ def planned_folder_items(
                 }
             )
         if item.folder_path != desired_path:
-            if item.status == CampaignOrganizationStatus.pending:
+            if existing_folder_paths is not None:
+                source_exists = item.folder_path in existing_folder_paths
+                desired_exists = desired_path in existing_folder_paths
+                if desired_exists or not source_exists:
+                    items.append(
+                        {
+                            "action": "create_folder",
+                            "target_path": desired_path,
+                            "reason": "organization_folder",
+                            "metadata_json": metadata,
+                        }
+                    )
+                    continue
+            elif item.status == CampaignOrganizationStatus.pending:
                 items.append(
                     {
                         "action": "create_folder",
@@ -529,6 +561,16 @@ def planned_folder_items(
                     "source_path": item.folder_path,
                     "target_path": desired_path,
                     "reason": "organization_folder_rename",
+                    "metadata_json": metadata,
+                }
+            )
+            continue
+        if existing_folder_paths is not None and desired_path not in existing_folder_paths:
+            items.append(
+                {
+                    "action": "create_folder",
+                    "target_path": desired_path,
+                    "reason": "organization_folder",
                     "metadata_json": metadata,
                 }
             )

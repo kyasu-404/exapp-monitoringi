@@ -65,6 +65,31 @@ def test_extract_organization_supports_udod_without_hardcoded_list():
     assert match.organization_id == "udod-imc"
 
 
+def test_generic_type_alias_matches_with_code_without_ambiguity_and_normalizes_name():
+    orgs = [
+        {"id": "school-1", "type": "school", "prefix": None, "code": "1", "display_name": "1", "aliases": [], "active": True},
+        {"id": "school-2", "type": "school", "prefix": None, "code": "2", "display_name": "2", "aliases": [], "active": True},
+    ]
+
+    match = extract_organization("ГБОУ1.xlsx", orgs)
+
+    assert match.status == "matched"
+    assert match.organization_id == "school-1"
+    assert match.normalized_name == "ГБОУ 1.xlsx"
+
+
+def test_udod_normalization_preserves_matching_alias():
+    orgs = [
+        {"id": "udod-444", "type": "udod", "prefix": None, "code": "444", "display_name": "444", "aliases": [], "active": True},
+    ]
+
+    match = extract_organization("ИМЦ444.pdf", orgs)
+
+    assert match.status == "matched"
+    assert match.organization_id == "udod-444"
+    assert match.normalized_name == "ИМЦ 444.pdf"
+
+
 def test_org_code_sort_keeps_special_names_after_numbers():
     values = ["Морская", "12", "1", "Малыш", "2"]
 
