@@ -24,7 +24,7 @@ RUN set -ex; \
         FRP_SHA256="${FRP_AMD64_SHA256}"; \
     fi; \
     FRP_URL="https://github.com/fatedier/frp/releases/download/v${FRP_VERSION}/frp_${FRP_VERSION}_linux_${FRP_ARCH}.tar.gz"; \
-    curl -fsSL "${FRP_URL}" -o /tmp/frp.tar.gz; \
+    curl -4 -fsSL --retry 5 --retry-delay 2 --connect-timeout 15 --max-time 180 "${FRP_URL}" -o /tmp/frp.tar.gz; \
     ACTUAL_SHA256=$(sha256sum /tmp/frp.tar.gz | cut -d' ' -f1); \
     if [ "$ACTUAL_SHA256" != "$FRP_SHA256" ]; then \
         echo "FRP checksum mismatch"; \
