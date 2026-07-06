@@ -5,7 +5,7 @@ from sqlmodel import Session, SQLModel, create_engine, select
 
 from monitoringi.models import Campaign, CampaignOrganization, CampaignOrganizationStatus, OperationItem, OperationItemStatus, Organization
 from monitoringi.reports import csv_bytes, link_rows, mailing_rows, render_template, spreadsheet_safe_value
-from monitoringi.services import apply_batch, create_batch, parse_organization_table, planned_folder_items
+from monitoringi.services import apply_batch, campaign_share_targets, create_batch, parse_organization_table, planned_folder_items
 
 
 def make_session():
@@ -159,6 +159,106 @@ def test_planned_folder_items_multiple_types_creates_type_sections():
         "organization_folder",
         "organization_folder",
     ]
+
+
+def test_campaign_root_upload_mode_uses_single_share_target_without_org_folders():
+    campaign = Campaign(
+        id="campaign-root",
+        title="root",
+        date=date(2026, 7, 2),
+        parent_nc_path="/Мониторинги",
+        campaign_folder_path="/Мониторинги/root",
+        selected_org_types=["school", "kindergarten"],
+        upload_mode="campaign_root",
+    )
+    organizations = [
+        Organization(id="org-school", type="school", code="42", display_name="ГБОУ 42"),
+        Organization(id="org-kindergarten", type="kindergarten", code="8", display_name="ГБДОУ 8"),
+    ]
+    campaign_orgs = [
+        CampaignOrganization(id="campaign-org-school", campaign_id=campaign.id, organization_id="org-school", folder_path="/Мониторинги/root"),
+        CampaignOrganization(id="campaign-org-kindergarten", campaign_id=campaign.id, organization_id="org-kindergarten", folder_path="/Мониторинги/root"),
+    ]
+
+    assert planned_folder_items(campaign, campaign_orgs, organizations) == []
+    targets = campaign_share_targets(campaign, campaign_orgs, organizations)
+
+    assert len(targets) == 1
+    assert targets[0]["target_path"] == "/Мониторинги/root"
+    assert targets[0]["campaign_org_ids"] == ["campaign-org-school", "campaign-org-kindergarten"]
+
+
+def test_campaign_root_upload_mode_ignores_folder_layout():
+    campaign = Campaign(
+        id="campaign-root-layout",
+        title="root-layout",
+        date=date(2026, 7, 2),
+        parent_nc_path="/Мониторинги",
+        campaign_folder_path="/Мониторинги/root-layout",
+        selected_org_types=["school", "kindergarten"],
+        upload_mode="campaign_root",
+        org_folder_layout="by_type",
+    )
+    organizations = [
+        Organization(id="org-school", type="school", code="42", display_name="ГБОУ 42"),
+        Organization(id="org-kindergarten", type="kindergarten", code="8", display_name="ГБДОУ 8"),
+    ]
+
+    assert planned_folder_items(campaign, [], organizations) == []
+
+
+def test_org_type_upload_mode_creates_type_folders_and_type_share_targets_only():
+    campaign = Campaign(
+        id="campaign-types",
+        title="types",
+        date=date(2026, 7, 2),
+        parent_nc_path="/Мониторинги",
+        campaign_folder_path="/Мониторинги/types",
+        selected_org_types=["school", "kindergarten"],
+        upload_mode="org_type",
+    )
+    organizations = [
+        Organization(id="org-school", type="school", code="42", display_name="ГБОУ 42"),
+        Organization(id="org-kindergarten", type="kindergarten", code="8", display_name="ГБДОУ 8"),
+    ]
+    campaign_orgs = [
+        CampaignOrganization(id="campaign-org-school", campaign_id=campaign.id, organization_id="org-school", folder_path="/Мониторинги/types/Школы"),
+        CampaignOrganization(id="campaign-org-kindergarten", campaign_id=campaign.id, organization_id="org-kindergarten", folder_path="/Мониторинги/types/Сады"),
+    ]
+
+    items = planned_folder_items(campaign, campaign_orgs, organizations)
+    targets = campaign_share_targets(campaign, campaign_orgs, organizations)
+
+    assert [item["target_path"] for item in items] == ["/Мониторинги/types/Школы", "/Мониторинги/types/Сады"]
+    assert all(item["reason"] == "organization_type_folder" for item in items)
+    assert [target["target_path"] for target in targets] == ["/Мониторинги/types/Школы", "/Мониторинги/types/Сады"]
+    assert [target["campaign_org_ids"] for target in targets] == [["campaign-org-school"], ["campaign-org-kindergarten"]]
+
+
+def test_organization_upload_mode_can_keep_all_org_folders_in_campaign_root():
+    campaign = Campaign(
+        id="campaign-flat",
+        title="flat",
+        date=date(2026, 7, 2),
+        parent_nc_path="/Мониторинги",
+        campaign_folder_path="/Мониторинги/flat",
+        selected_org_types=["school", "kindergarten"],
+        upload_mode="organization",
+        org_folder_layout="flat",
+    )
+    organizations = [
+        Organization(id="org-school", type="school", code="42", display_name="ГБОУ 42"),
+        Organization(id="org-kindergarten", type="kindergarten", code="8", display_name="ГБДОУ 8"),
+    ]
+    campaign_orgs = [
+        CampaignOrganization(id="campaign-org-school", campaign_id=campaign.id, organization_id="org-school", folder_path="/Мониторинги/flat/old-school"),
+        CampaignOrganization(id="campaign-org-kindergarten", campaign_id=campaign.id, organization_id="org-kindergarten", folder_path="/Мониторинги/flat/old-kindergarten"),
+    ]
+
+    items = planned_folder_items(campaign, campaign_orgs, organizations)
+
+    assert [item["target_path"] for item in items] == ["/Мониторинги/flat/42", "/Мониторинги/flat/8"]
+    assert all(item["reason"] == "organization_folder" for item in items)
 
 
 def test_planned_folder_items_rechecks_existing_webdav_folders():

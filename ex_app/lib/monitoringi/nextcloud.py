@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import xml.etree.ElementTree as ET
+import json
 from base64 import b64encode
 from dataclasses import dataclass
 from datetime import date, datetime, timezone
@@ -95,6 +96,13 @@ def _mail_bridge_token() -> str | None:
     except OSError:
         return None
     return token or None
+
+
+def _share_attributes(*, file_request_enabled: bool | None = None) -> str | None:
+    attributes = []
+    if file_request_enabled is not None:
+        attributes.append({"scope": "fileRequest", "key": "enabled", "value": file_request_enabled})
+    return json.dumps(attributes, ensure_ascii=False) if attributes else None
 
 
 def _parse_http_date(value: str | None) -> datetime | None:
@@ -282,6 +290,7 @@ class NextcloudClient:
         expire_date: date | datetime | str | None = None,
         password: str | None = None,
         permissions: int = 4,
+        file_request: bool = False,
         label: str | None = None,
         note: str | None = None,
     ) -> dict[str, str | int | None]:
@@ -292,6 +301,9 @@ class NextcloudClient:
             "permissions": permissions,
             "publicUpload": "true" if public_upload else "false",
         }
+        attributes = _share_attributes(file_request_enabled=file_request)
+        if attributes:
+            form["attributes"] = attributes
         if expire_date:
             if isinstance(expire_date, datetime):
                 form["expireDate"] = expire_date.date().isoformat()
@@ -352,12 +364,66 @@ class NextcloudClient:
         data = payload.get("data", [])
         return data if isinstance(data, list) else []
 
-    async def update_share_permissions(self, share_id: str, permissions: int) -> None:
+    async def list_groups(self, *, search: str = "", limit: int = 200) -> list[str]:
+        params = {"format": "json", "search": search, "limit": limit}
+        headers = {"OCS-APIRequest": "true", "Accept": "application/json"}
+        response = await self._client.get("/ocs/v2.php/cloud/groups", params=params, headers=headers)
+        if response.status_code == 404:
+            response = await self._client.get("/ocs/v1.php/cloud/groups", params=params, headers=headers)
+        if response.status_code in {401, 403}:
+            raise NextcloudApiError("GROUPS_API_FORBIDDEN", "Нет прав на получение списка групп Nextcloud.", response.status_code)
+        if response.status_code >= 400:
+            raise NextcloudApiError("GROUPS_API_FAILED", "Не удалось получить список групп Nextcloud.", 502, response.text)
+        payload = response.json().get("ocs", {})
+        meta = payload.get("meta", {})
+        if int(meta.get("statuscode", 100)) >= 400:
+            raise NextcloudApiError("GROUPS_API_FAILED", str(meta.get("message") or "Ошибка OCS Groups API."), 502)
+        data = payload.get("data", {})
+        groups = data.get("groups", data) if isinstance(data, dict) else data
+        return sorted({str(group).strip() for group in groups or [] if str(group).strip()}, key=str.casefold)
+
+    async def user_email(self, user_id: str) -> str:
+        user_id = str(user_id or "").strip()
+        if not user_id:
+            raise NextcloudApiError("CURRENT_USER_NOT_FOUND", "Не удалось определить текущего пользователя Nextcloud.", 400)
+        params = {"format": "json"}
+        headers = {"OCS-APIRequest": "true", "Accept": "application/json"}
+        response = await self._client.get(f"/ocs/v2.php/cloud/users/{quote(user_id, safe='')}", params=params, headers=headers)
+        if response.status_code == 404:
+            response = await self._client.get(f"/ocs/v1.php/cloud/users/{quote(user_id, safe='')}", params=params, headers=headers)
+        if response.status_code in {401, 403}:
+            raise NextcloudApiError("USERS_API_FORBIDDEN", "Нет прав на получение email текущего пользователя Nextcloud.", response.status_code)
+        if response.status_code >= 400:
+            raise NextcloudApiError("USERS_API_FAILED", "Не удалось получить данные текущего пользователя Nextcloud.", 502, response.text)
+        payload = response.json().get("ocs", {})
+        meta = payload.get("meta", {})
+        if int(meta.get("statuscode", 100)) >= 400:
+            raise NextcloudApiError("USERS_API_FAILED", str(meta.get("message") or "Ошибка OCS Users API."), 502)
+        data = payload.get("data", {})
+        email = str(data.get("email") or data.get("emailAddress") or "").strip()
+        if not email:
+            raise NextcloudApiError("CURRENT_USER_EMAIL_MISSING", "У текущего пользователя Nextcloud не указан email.", 400)
+        return email
+
+    async def update_share_permissions(
+        self,
+        share_id: str,
+        permissions: int,
+        *,
+        public_upload: bool | None = None,
+        file_request: bool | None = None,
+    ) -> None:
+        data: dict[str, str | int] = {"permissions": permissions}
+        if public_upload is not None:
+            data["publicUpload"] = "true" if public_upload else "false"
+        attributes = _share_attributes(file_request_enabled=file_request)
+        if attributes:
+            data["attributes"] = attributes
         response = await self._client.put(
             f"/ocs/v2.php/apps/files_sharing/api/v1/shares/{quote(str(share_id), safe='')}",
             params={"format": "json"},
             headers={"OCS-APIRequest": "true", "Accept": "application/json"},
-            data={"permissions": permissions},
+            data=data,
         )
         if response.status_code in {401, 403}:
             raise NextcloudApiError("SHARE_API_FORBIDDEN", "Нет прав на изменение общего доступа.", response.status_code)

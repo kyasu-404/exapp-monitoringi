@@ -9,7 +9,7 @@ from typing import Any
 
 from pydantic import BaseModel, EmailStr, Field, field_validator
 
-from .models import OrganizationType
+from .models import CampaignOrgLayout, CampaignUploadMode, OrganizationType
 
 
 class OrganizationIn(BaseModel):
@@ -92,6 +92,8 @@ class CampaignIn(BaseModel):
     selected_org_types: list[OrganizationType] = Field(default_factory=list)
     allowed_extensions: list[str] = Field(default_factory=lambda: ["pdf", "docx", "xlsx"])
     allowed_mime_types: list[str] = Field(default_factory=list)
+    upload_mode: CampaignUploadMode = CampaignUploadMode.organization
+    org_folder_layout: CampaignOrgLayout = CampaignOrgLayout.auto
 
     @field_validator("deadline", mode="before")
     @classmethod
@@ -121,6 +123,8 @@ class CampaignPatch(BaseModel):
     selected_org_types: list[OrganizationType] | None = None
     allowed_extensions: list[str] | None = None
     allowed_mime_types: list[str] | None = None
+    upload_mode: CampaignUploadMode | None = None
+    org_folder_layout: CampaignOrgLayout | None = None
     status: str | None = None
 
     @field_validator("deadline", mode="before")

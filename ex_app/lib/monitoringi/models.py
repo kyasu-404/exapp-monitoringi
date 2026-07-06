@@ -48,6 +48,18 @@ class CampaignOrganizationStatus(str, Enum):
     missing = "missing"
 
 
+class CampaignUploadMode(str, Enum):
+    campaign_root = "campaign_root"
+    org_type = "org_type"
+    organization = "organization"
+
+
+class CampaignOrgLayout(str, Enum):
+    auto = "auto"
+    flat = "flat"
+    by_type = "by_type"
+
+
 class FileClassification(str, Enum):
     valid = "valid"
     duplicate = "duplicate"
@@ -124,6 +136,8 @@ class Campaign(SQLModel, table=True):
     selected_org_types: list[str] = Field(default_factory=list, sa_column=Column(SAJSON))
     allowed_extensions: list[str] = Field(default_factory=list, sa_column=Column(SAJSON))
     allowed_mime_types: list[str] = Field(default_factory=list, sa_column=Column(SAJSON))
+    upload_mode: str = Field(default=CampaignUploadMode.organization.value, index=True)
+    org_folder_layout: str = Field(default=CampaignOrgLayout.auto.value, index=True)
     status: CampaignStatus = Field(default=CampaignStatus.draft, index=True)
     created_by: str | None = None
     created_at: datetime = Field(default_factory=utcnow)

@@ -2,13 +2,28 @@
   function boot() {
     const storedRenameTemplate = window.localStorage?.getItem("mrmRenameTemplate") || ""
     const activeRenameTemplate = storedRenameTemplate && storedRenameTemplate !== "ГБДОУ {номер} отчёт" ? storedRenameTemplate : "текст {алиас} {номер} текст"
+    const allowedViews = ["dashboard", "organizations", "campaigns", "operations", "settings"]
+    const storedView = window.localStorage?.getItem("mrmView") || "dashboard"
+    const operationTabs = [
+      ["log", "Лог"],
+      ["folders", "Папки"],
+      ["links", "Ссылки"],
+      ["scan", "Проверка"],
+      ["messages", "Рассылка"],
+      ["rename", "Переименование"],
+    ]
+    const allowedOperationTabs = operationTabs.map(([id]) => id)
+    const storedOperationTab = window.localStorage?.getItem("mrmOperationTab") || "log"
     const state = {
-      view: "dashboard",
+      view: allowedViews.includes(storedView) ? storedView : "dashboard",
       organizations: [],
       campaigns: [],
+      groups: [],
+      groupsLoaded: false,
+      groupsLoading: false,
       recentUploads: [],
       settings: {},
-      selectedCampaignId: "",
+      selectedCampaignId: window.localStorage?.getItem("mrmSelectedCampaignId") || "",
       editingOrganizationId: "",
       editingCampaignId: "",
       organizationFilter: "all",
@@ -16,8 +31,20 @@
       contextChecked: false,
       lastBatch: null,
       operationBatches: {},
+      operationHistory: {},
+      operationTab: allowedOperationTabs.includes(storedOperationTab) ? storedOperationTab : "log",
       operationState: {},
       renameTemplate: activeRenameTemplate,
+    }
+
+    function persistUiState() {
+      window.localStorage?.setItem("mrmView", state.view)
+      if (state.selectedCampaignId) {
+        window.localStorage?.setItem("mrmSelectedCampaignId", state.selectedCampaignId)
+      } else {
+        window.localStorage?.removeItem("mrmSelectedCampaignId")
+      }
+      window.localStorage?.setItem("mrmOperationTab", state.operationTab)
     }
 
     const organizationTypes = [
@@ -43,6 +70,7 @@
     ]
 
     const DIRECTORY_MIME_TYPE = "httpd/unix-directory"
+    const commonExtensions = ["pdf", "doc", "docx", "xls", "xlsx", "ods", "odt", "csv", "txt", "zip", "7z", "rar", "jpg", "jpeg", "png"]
 
     const statusLabels = {
       draft: "Черновик",
@@ -65,6 +93,9 @@
       completed_with_errors: "Завершено с ошибками",
       failed: "Ошибка",
       cancelled: "Отменено",
+      sending: "Отправляется",
+      sent: "Отправлено",
+      bounced: "Не доставлено",
       success: "Успешно",
       skipped: "Пропущено",
       planned: "Запланировано",
@@ -176,6 +207,10 @@
       return window.btoa(binary)
     }
 
+    function messageBatchId(batch) {
+      return batch?.message_batch_id || batch?.batch_id || batch?.id || ""
+    }
+
     async function loadBase() {
       try {
         const [organizations, campaigns, settings, recentUploads] = await Promise.all([
@@ -193,7 +228,23 @@
           state.selectedCampaignId = campaigns[0]?.id || ""
         }
         if (previousCampaignId !== state.selectedCampaignId) state.operationBatches = {}
-        state.operationState = state.selectedCampaignId ? await api(`/campaigns/${state.selectedCampaignId}/operation-state`).catch(() => ({})) : {}
+        if (state.selectedCampaignId) {
+          const [operationState, operationHistory] = await Promise.all([
+            api(`/campaigns/${state.selectedCampaignId}/operation-state`).catch(() => ({})),
+            api(`/campaigns/${state.selectedCampaignId}/operation-history`).catch(() => ({})),
+          ])
+          state.operationState = operationState
+          state.operationHistory = operationHistory
+        } else {
+          state.operationState = {}
+          state.operationHistory = {}
+        }
+        if (state.view === "operations" && !state.lastBatch) {
+          const batchId = messageBatchId(state.operationState.message_batch)
+          if (batchId) {
+            state.lastBatch = await api(`/message-batches/${encodeURIComponent(batchId)}`, { method: "POST" }).catch(() => null)
+          }
+        }
         if (state.fileIds && !state.contextChecked) {
           state.contextChecked = true
           const context = await api(`/context-folder?file_ids=${encodeURIComponent(state.fileIds)}`)
@@ -205,6 +256,7 @@
             setNotice("Данный каталог не является мониторингом", true)
           }
         }
+        persistUiState()
         render()
       } catch (error) {
         setNotice(error.message, true)
@@ -221,6 +273,54 @@
 
     function typeLabel(value) {
       return organizationTypes.find(([id]) => id === value)?.[1] || String(value || "")
+    }
+
+    const uploadModeLabels = {
+      campaign_root: "Одна ссылка на корень",
+      org_type: "Ссылка на каждый тип ОУ",
+      organization: "Ссылка для каждой организации",
+    }
+
+    const orgFolderLayoutLabels = {
+      auto: "Авто",
+      flat: "Организации в корне",
+      by_type: "Организации внутри типов",
+    }
+
+    function uploadModeLabel(value) {
+      return uploadModeLabels[value] || uploadModeLabels.organization
+    }
+
+    function orgFolderLayoutLabel(value) {
+      return orgFolderLayoutLabels[value] || orgFolderLayoutLabels.auto
+    }
+
+    function campaignStructureLabel(campaign) {
+      return campaign?.upload_mode === "organization" ? orgFolderLayoutLabel(campaign.org_folder_layout) : "Не используется"
+    }
+
+    function chips(values) {
+      return (values || []).filter(Boolean).map((value) => `<span class="mrm-chip">${h(value)}</span>`).join("")
+    }
+
+    function compactExtensions(values) {
+      const extensions = values || []
+      if (!extensions.length) return "—"
+      if (extensions.length <= 4) return extensions.join(", ")
+      return `${extensions.slice(0, 4).join(", ")} +${extensions.length - 4}`
+    }
+
+    function campaignTitle(id) {
+      return state.campaigns.find((item) => item.id === id)?.title || "мониторинг"
+    }
+
+    function syncCampaignStructureControls(form) {
+      const uploadSelect = form?.elements?.upload_mode
+      const layoutSelect = form?.elements?.org_folder_layout
+      if (!uploadSelect || !layoutSelect) return
+      const enabled = uploadSelect.value === "organization"
+      layoutSelect.disabled = !enabled
+      if (!enabled) layoutSelect.value = "auto"
     }
 
     function defaultAliasesForType(value) {
@@ -275,6 +375,87 @@
           `,
         )
         .join("")
+    }
+
+    function extensionValues(selected = ["pdf", "docx", "xlsx"]) {
+      const selectedValues = (selected || []).map((item) => String(item || "").trim().toLowerCase()).filter(Boolean)
+      return Array.from(new Set([...commonExtensions, ...(state.settings.default_extensions || []), ...selectedValues].map((item) => String(item || "").trim().toLowerCase()).filter(Boolean)))
+    }
+
+    function extensionTagHtml(value) {
+      return `<button class="mrm-tag" type="button" data-extension-remove="${h(value)}">${h(value)} <span aria-hidden="true">×</span></button>`
+    }
+
+    function extensionInputHtml(value) {
+      return `<input type="hidden" name="allowed_extensions" value="${h(value)}">`
+    }
+
+    function extensionPicker(selected = ["pdf", "docx", "xlsx"]) {
+      const selectedValues = Array.from(new Set((selected || []).map((item) => String(item || "").trim().toLowerCase()).filter(Boolean)))
+      const values = new Set(selectedValues)
+      const extensions = extensionValues(selectedValues)
+      const tags = selectedValues.length
+        ? selectedValues.map(extensionTagHtml).join("")
+        : `<span class="mrm-multiselect-placeholder">Выберите расширения</span>`
+      return `
+        <div class="mrm-multiselect" data-extension-picker>
+          <div class="mrm-multiselect-control" data-extension-control tabindex="0" role="button" aria-haspopup="listbox" aria-expanded="false">
+            <div class="mrm-multiselect-tags" data-extension-tags>${tags}</div>
+            <span class="mrm-multiselect-arrow" aria-hidden="true"></span>
+          </div>
+          <div class="mrm-multiselect-menu" role="listbox">
+            ${extensions
+              .map(
+                (value) => `
+                  <button class="mrm-multiselect-option ${values.has(value) ? "is-selected" : ""}" type="button" data-extension-option="${h(value)}" aria-selected="${values.has(value) ? "true" : "false"}">
+                    ${h(value)}
+                  </button>
+                `,
+              )
+              .join("")}
+          </div>
+          <div data-extension-inputs>${selectedValues.map(extensionInputHtml).join("")}</div>
+        </div>
+      `
+    }
+
+    function selectedExtensionValues(picker) {
+      return Array.from(picker.querySelectorAll('input[name="allowed_extensions"]')).map((input) => input.value).filter(Boolean)
+    }
+
+    function setExtensionValues(picker, values) {
+      const selectedValues = Array.from(new Set((values || []).map((item) => String(item || "").trim().toLowerCase()).filter(Boolean)))
+      const selected = new Set(selectedValues)
+      const tags = picker.querySelector("[data-extension-tags]")
+      const inputs = picker.querySelector("[data-extension-inputs]")
+      if (tags) {
+        tags.innerHTML = selectedValues.length
+          ? selectedValues.map(extensionTagHtml).join("")
+          : `<span class="mrm-multiselect-placeholder">Выберите расширения</span>`
+      }
+      if (inputs) inputs.innerHTML = selectedValues.map(extensionInputHtml).join("")
+      picker.querySelectorAll("[data-extension-option]").forEach((option) => {
+        const active = selected.has(option.dataset.extensionOption)
+        option.classList.toggle("is-selected", active)
+        option.setAttribute("aria-selected", active ? "true" : "false")
+      })
+    }
+
+    function toggleExtensionPicker(picker, force) {
+      const open = force ?? !picker.classList.contains("is-open")
+      picker.classList.toggle("is-open", open)
+      picker.querySelector("[data-extension-control]")?.setAttribute("aria-expanded", open ? "true" : "false")
+    }
+
+    function closeExtensionPickers(except = null) {
+      root.querySelectorAll("[data-extension-picker].is-open").forEach((picker) => {
+        if (picker !== except) toggleExtensionPicker(picker, false)
+      })
+    }
+
+    function groupOptions(selected) {
+      const groups = Array.from(new Set([...(state.groups || []), selected].map((item) => String(item || "").trim()).filter(Boolean))).sort((a, b) => a.localeCompare(b, "ru"))
+      return [`<option value="">Не выбрана</option>`, ...groups.map((group) => `<option value="${h(group)}" ${selected === group ? "selected" : ""}>${h(group)}</option>`)].join("")
     }
 
     function normalizeMimeType(mimetype) {
@@ -364,9 +545,9 @@
     }
 
     function statusPill(status) {
-      const ok = ["active", "uploaded", "accepted", "completed", "links_created", "success", "valid"]
-      const warn = ["draft", "preview", "missing", "completed_with_errors", "folders_created", "planned", "skipped", "duplicate", "unknown"]
-      const errors = ["failed", "invalid_extension", "invalid_name", "trash"]
+      const ok = ["active", "uploaded", "accepted", "completed", "links_created", "success", "valid", "sent"]
+      const warn = ["draft", "preview", "missing", "completed_with_errors", "folders_created", "planned", "skipped", "duplicate", "unknown", "sending", "pending"]
+      const errors = ["failed", "invalid_extension", "invalid_name", "trash", "bounced"]
       const cls = ok.includes(status) ? "ok" : warn.includes(status) ? "warn" : errors.includes(status) ? "error" : ""
       return `<span class="mrm-pill ${cls}">${h(statusLabels[status] || status)}</span>`
     }
@@ -374,9 +555,12 @@
     const operationLabels = {
       create_folders: "Создать папки для всех",
       create_shares: "Ссылки для загрузки",
+      delete_shares: "Удаление публичных ссылок",
       scan: "Очистка от дублей и мусора",
+      scan_cleanup: "Обработка файлов проверки",
       rename: "Переименование по шаблону",
       move: "Перемещение ошибочных файлов",
+      messages: "Письма организациям",
     }
 
     const actionLabels = {
@@ -393,7 +577,9 @@
       campaign_folder: "Папка мониторинга",
       organization_folder: "Папка организации",
       organization_folder_rename: "Изменился номер организации",
-      public_upload_link: "Ссылка для загрузки файлов",
+      public_upload_link: "Запрос файла",
+      public_edit_link: "Ссылка с редактированием",
+      public_share: "Публичная ссылка",
       normalized_filename: "Имя будет приведено к единому виду",
       template_rename: "Имя будет построено по заданному шаблону",
       duplicate_old_version: "Дубль, оставлена более новая версия",
@@ -415,10 +601,14 @@
       eligible: "Можно переименовать",
       folders_to_create: "Папок проверить/создать",
       folders_to_rename: "Папок переименовать",
+      share_targets: "Целей для ссылок",
       shares_to_create: "Ссылок создать",
       existing_links: "Ссылок уже есть",
+      deleted: "Удалено",
       organizations_without_email: "Организаций без email",
       planned: "Запланировано",
+      pending: "К отправке",
+      sent: "Отправлено",
       already_ok: "Уже в порядке",
       skipped: "Пропущено",
       trash_moved: "Перемещено в Мусор",
@@ -433,6 +623,8 @@
       unknown: "Не распознано",
       invalid_extension: "Неверное расширение",
       invalid_name: "Неверное имя",
+      missing: "Без файлов",
+      without_email: "Без email",
     }
 
     function summaryLabel(key) {
@@ -459,6 +651,12 @@
       if (status === "completed" || status === "completed_with_errors") {
         return "Операция выполнена. Строки со статусом «Ошибка» требуют проверки вручную."
       }
+      if (result.operation_type === "messages" && status === "preview" && (result.summary?.pending || 0) > 0) {
+        return "Письма подготовлены. Нажмите отправку, чтобы передать pending-письма в почтовый мост."
+      }
+      if (result.operation_type === "messages" && (result.summary?.pending || 0) === 0) {
+        return "Нет писем, готовых к отправке. Обычно это значит, что у отсутствующих организаций не указан email или все письма уже обработаны."
+      }
       return ""
     }
 
@@ -480,7 +678,11 @@
         .join("")
       const title = operationLabels[result.operation_type] || (result.files ? "Проверка файлов" : "Результат операции")
       const note = resultNote(result)
-      const rows = result.items ? operationRows(result.items, result.operation_type) : fileRows(result.files || [])
+      const rows = result.operation_type === "messages"
+        ? messageRows(result.items || [])
+        : result.items
+          ? operationRows(result.items, result.operation_type)
+          : fileRows(result.files || [])
       return `
         <div class="mrm-result">
           <div class="mrm-result-head">
@@ -515,6 +717,34 @@
                       <td>${statusPill(item.status)}</td>
                       <td class="is-wrap">${org}${source}${target}</td>
                       <td class="is-wrap">${h(item.error || reasonLabels[item.reason] || item.reason || "")}</td>
+                    </tr>
+                  `
+                })
+                .join("")}
+            </tbody>
+          </table>
+        </div>
+      `
+    }
+
+    function messageRows(items) {
+      if (!items.length) return `<div class="mrm-empty">Писем для выбранного результата проверки нет.</div>`
+      return `
+        <div class="mrm-table-wrap">
+          <table class="mrm-table">
+            <thead><tr><th>Организация</th><th>Email</th><th>Статус</th><th>Тема</th><th>Комментарий</th></tr></thead>
+            <tbody>
+              ${items
+                .map((item) => {
+                  const org = item.organization_code || item.organization_name || item.organization_id || ""
+                  const email = item.to_email || ""
+                  return `
+                    <tr>
+                      <td>${h(org)}</td>
+                      <td>${email ? h(email) : `<span class="mrm-muted-line">не указан</span>`}</td>
+                      <td>${statusPill(item.status)}</td>
+                      <td class="is-wrap">${h(item.subject || "")}</td>
+                      <td class="is-wrap">${h(item.last_error || item.error || "")}</td>
                     </tr>
                   `
                 })
@@ -735,14 +965,45 @@
       )
     }
 
+    function campaignRows(items) {
+      return items
+        .map((item) => {
+          const typeChips = chips((item.selected_org_types || []).map(typeLabel))
+          const settingsChips = chips([
+            uploadModeLabel(item.upload_mode),
+            campaignStructureLabel(item),
+            compactExtensions(item.allowed_extensions || []),
+          ])
+          return `
+            <tr>
+              <td class="mrm-campaign-title-cell">
+                <strong>${h(item.title)}</strong>
+                <span>${h(item.campaign_folder_path)}</span>
+              </td>
+              <td><div class="mrm-chip-row">${typeChips || `<span class="mrm-muted-line">—</span>`}</div></td>
+              <td><div class="mrm-chip-row">${settingsChips}</div></td>
+              <td class="mrm-row-actions mrm-row-actions-compact">
+                <button class="mrm-button compact" type="button" data-select-campaign="${h(item.id)}">Выбрать</button>
+                <button class="mrm-button compact" type="button" data-edit-campaign="${h(item.id)}">Изменить</button>
+                <button class="mrm-button compact" type="button" data-move-campaign="${h(item.id)}">Переместить</button>
+                <button class="mrm-button compact danger" type="button" data-archive-campaign="${h(item.id)}">В архив</button>
+              </td>
+            </tr>
+          `
+        })
+        .join("")
+    }
+
     function campaigns() {
       const editing = state.campaigns.find((item) => item.id === state.editingCampaignId)
       const selectedTypes = editing?.selected_org_types || ["school"]
-      const allowedExtensions = (editing?.allowed_extensions || ["pdf", "docx", "xlsx"]).join(",")
+      const allowedExtensions = editing?.allowed_extensions || state.settings.default_extensions || ["pdf", "docx", "xlsx"]
+      const uploadMode = editing?.upload_mode || "organization"
+      const orgFolderLayout = editing?.org_folder_layout || "auto"
       return shell(
         `
         <section class="mrm-grid">
-          <form class="mrm-form" data-form="campaign">
+          <form class="mrm-form mrm-campaign-form" data-form="campaign">
             <h3>${editing ? "Редактирование" : "Мониторинг"}</h3>
             <div class="mrm-fields">
               <div class="mrm-field"><label>Название</label><input name="title" value="${h(editing?.title)}" required></div>
@@ -758,7 +1019,22 @@
                 <label>Типы ОУ</label>
                 <div class="mrm-checklist">${orgTypeChecks(selectedTypes)}</div>
               </div>
-              <div class="mrm-field"><label>Расширения</label><input name="allowed_extensions" value="${h(allowedExtensions)}"></div>
+              <div class="mrm-field">
+                <label>Ссылки для загрузки</label>
+                <select name="upload_mode">
+                  ${Object.entries(uploadModeLabels).map(([value, label]) => `<option value="${h(value)}" ${uploadMode === value ? "selected" : ""}>${h(label)}</option>`).join("")}
+                </select>
+              </div>
+              <div class="mrm-field">
+                <label>Структура папок</label>
+                <select name="org_folder_layout" ${uploadMode === "organization" ? "" : "disabled"}>
+                  ${Object.entries(orgFolderLayoutLabels).map(([value, label]) => `<option value="${h(value)}" ${orgFolderLayout === value ? "selected" : ""}>${h(label)}</option>`).join("")}
+                </select>
+              </div>
+              <div class="mrm-field">
+                <label>Расширения</label>
+                ${extensionPicker(allowedExtensions)}
+              </div>
               <div class="mrm-form-actions">
                 <button class="mrm-button primary" type="submit">${editing ? "Сохранить" : "Создать"}</button>
                 ${editing ? `<button class="mrm-button" type="button" data-cancel-campaign>Отмена</button>` : ""}
@@ -769,28 +1045,11 @@
             <div class="mrm-panel-header">
               <h3>Мониторинги</h3>
             </div>
-            <div class="mrm-table-wrap">
-              <table class="mrm-table">
-                <thead><tr><th>Название</th><th>Папка</th><th>Типы ОУ</th><th>Расширения</th><th></th></tr></thead>
+            <div class="mrm-table-wrap mrm-campaign-table-wrap">
+              <table class="mrm-table mrm-campaign-table">
+                <thead><tr><th>Мониторинг</th><th>Типы ОУ</th><th>Параметры</th><th></th></tr></thead>
                 <tbody>
-                  ${state.campaigns
-                    .map(
-                      (item) => `
-                        <tr>
-                          <td>${h(item.title)}</td>
-                          <td class="is-wrap">${h(item.campaign_folder_path)}</td>
-                          <td>${h((item.selected_org_types || []).map(typeLabel).join(", "))}</td>
-                          <td>${h((item.allowed_extensions || []).join(", "))}</td>
-                          <td class="mrm-row-actions">
-                            <button class="mrm-button compact" type="button" data-edit-campaign="${h(item.id)}">Изменить</button>
-                            <button class="mrm-button compact" type="button" data-move-campaign="${h(item.id)}">Переместить</button>
-                            <button class="mrm-button compact" type="button" data-select-campaign="${h(item.id)}">Выбрать</button>
-                            <button class="mrm-button compact danger" type="button" data-archive-campaign="${h(item.id)}">В архив</button>
-                          </td>
-                        </tr>
-                      `,
-                    )
-                    .join("") || `<tr><td colspan="5">Нет мониторингов</td></tr>`}
+                  ${campaignRows(state.campaigns) || `<tr><td colspan="4">Нет мониторингов</td></tr>`}
                 </tbody>
               </table>
             </div>
@@ -828,11 +1087,17 @@
               </div>
               <div class="mrm-field">
                 <label>Группа доступа</label>
-                <input name="collaboration_group" value="${h(collaborationGroup)}">
+                <div class="mrm-input-action">
+                  <select name="collaboration_group" data-group-select>
+                    ${groupOptions(collaborationGroup)}
+                  </select>
+                  <button class="mrm-button" type="button" data-load-groups>${state.groupsLoading ? "Загрузка" : "Обновить"}</button>
+                </div>
               </div>
               <div class="mrm-form-actions">
                 <button class="mrm-button primary" type="submit">Сохранить</button>
                 <button class="mrm-button" type="button" data-test-webdav>Проверить</button>
+                <button class="mrm-button" type="button" data-test-mail>Проверить почту</button>
               </div>
             </div>
           </form>
@@ -845,6 +1110,281 @@
 
     function checkSummaryText(summary = {}) {
       return `Файлов найдено: ${summary.total || 0}; Корректных: ${summary.valid || 0}; Дублей: ${summary.duplicate || 0}; Неподходящих: ${(summary.invalid_extension || 0) + (summary.invalid_name || 0) + (summary.unknown || 0)}; Не предоставили: ${summary.missing || 0}`
+    }
+
+    function hasValue(value) {
+      if (Array.isArray(value)) return value.length > 0
+      return value !== undefined && value !== null && value !== ""
+    }
+
+    function displayValue(value) {
+      if (!hasValue(value)) return "—"
+      if (Array.isArray(value)) return value.join(", ")
+      return String(value)
+    }
+
+    function operationTabLabel(tab) {
+      return operationTabs.find(([id]) => id === tab)?.[1] || tab
+    }
+
+    function operationTabForResult(result) {
+      const type = result?.operation_type || ""
+      if (type === "create_folders") return "folders"
+      if (type === "create_shares" || type === "delete_shares") return "links"
+      if (type === "scan" || type === "scan_cleanup") return "scan"
+      if (type === "messages") return "messages"
+      if (type === "rename") return "rename"
+      return ""
+    }
+
+    function resultRunId(result) {
+      return result?.run_id || result?.batch_id || result?.check_result_id || result?.message_batch_id || ""
+    }
+
+    function folderStructureLabel(value) {
+      const labels = {
+        campaign_root: "Корень мониторинга",
+        flat: "Папки ОУ в корне",
+        by_type: "Папки по типам ОУ",
+        auto: "Авто",
+      }
+      return labels[value] || displayValue(value)
+    }
+
+    function runStartedAt(run) {
+      return run.started_at || run.queued_at || run.created_at || run.finished_at || ""
+    }
+
+    function runDate(value) {
+      const formatted = formatDateTime(value)
+      return formatted || displayValue(value)
+    }
+
+    function summaryContextValue(summary, context, key) {
+      if (hasValue(summary?.[key])) return summary[key]
+      if (hasValue(context?.[key])) return context[key]
+      return ""
+    }
+
+    function summaryRows(rows) {
+      return `
+        <dl class="mrm-summary-list">
+          ${rows
+            .map(
+              (row) => `
+                <div>
+                  <dt>${h(row.label)}</dt>
+                  <dd class="${row.long ? "is-preline" : ""}">${h(displayValue(row.value))}</dd>
+                </div>
+              `,
+            )
+            .join("")}
+        </dl>
+      `
+    }
+
+    function operationRunSummaryRows(tab, run) {
+      const summary = run.summary || {}
+      const context = state.operationHistory?.context || {}
+      const value = (key) => summaryContextValue(summary, context, key)
+      if (tab === "folders") {
+        return [
+          { label: "Операция запускалась", value: runDate(runStartedAt(run)) },
+          { label: "Путь", value: value("path") },
+          { label: "Создано папок", value: summary.success ?? summary.folders_to_create ?? summary.planned ?? 0 },
+          { label: "Задействованные типы ОУ", value: value("organization_type_labels") },
+          { label: "Структура папок", value: folderStructureLabel(value("folder_structure")) },
+          { label: "Ошибок", value: summary.failed ?? summary.operation_errors ?? 0 },
+        ]
+      }
+      if (tab === "links") {
+        const isDelete = run.operation_type === "delete_shares"
+        return [
+          { label: "Операция запускалась", value: runDate(runStartedAt(run)) },
+          { label: "Тип ссылок", value: uploadModeLabel(value("upload_mode")) },
+          { label: "Срок публикации", value: runDate(value("deadline")) },
+          { label: isDelete ? "Удалено ссылок" : "Создано ссылок", value: isDelete ? summary.deleted ?? summary.success ?? 0 : summary.success ?? summary.shares_to_create ?? summary.share_targets ?? 0 },
+          { label: "Ошибок", value: summary.failed ?? 0 },
+        ]
+      }
+      if (tab === "scan") {
+        return [
+          { label: "Операция запускалась", value: runDate(runStartedAt(run)) },
+          { label: "Нормализовано файлов", value: summary.renamed ?? 0 },
+          { label: "Помещено в дубли", value: summary.duplicates_moved ?? 0 },
+          { label: "Помещено в мусор", value: summary.trash_moved ?? 0 },
+          { label: "Не предоставлено", value: summary.missing ?? 0 },
+          { label: "Не предоставившие ОУ", value: summary.missing_organization_names || summary.missing_organization_codes || "" },
+        ]
+      }
+      if (tab === "messages") {
+        return [
+          { label: "Синхронизировано с проверкой файлов от", value: runDate(summary.check_result_created_at || run.check_result_created_at) },
+          { label: "Не предоставлено", value: summary.missing ?? summary.planned ?? 0 },
+          { label: "Не предоставившие ОУ", value: summary.missing_organization_names || summary.missing_organization_codes || "" },
+          { label: "Из них без Email", value: summary.without_email ?? summary.failed ?? 0 },
+          { label: "Последняя рассылка напоминаний", value: runDate(run.finished_at || run.queued_at || "") },
+          { label: "Превью рассылки", value: summary.preview_text || "", long: true },
+        ]
+      }
+      if (tab === "rename") {
+        return [
+          { label: "Операция запускалась", value: runDate(runStartedAt(run)) },
+          { label: "Количество переименованных", value: summary.success ?? summary.renamed ?? summary.planned ?? 0 },
+          { label: "Типы ОУ", value: value("organization_type_labels") },
+          { label: "Указанный шаблон", value: summary.name_template || state.renameTemplate },
+        ]
+      }
+      return []
+    }
+
+    function operationRunTitle(run) {
+      const label = operationLabels[run.operation_type] || operationTabLabel(operationTabForResult(run))
+      const status = run.status ? ` · ${statusLabels[run.status] || run.status}` : ""
+      return `${label}${status}`
+    }
+
+    function operationRunDetails(tab, run) {
+      if (run.operation_type === "messages") return messageRows(run.items || [])
+      if (tab === "scan" && run.files) return fileRows(run.files || [])
+      if (tab === "scan" && run.cleanup_batch?.items?.length) return operationRows(run.cleanup_batch.items, "scan_cleanup")
+      if (run.items) return operationRows(run.items, run.operation_type)
+      return `<div class="mrm-empty">Детальные строки для этого запуска не сохранены.</div>`
+    }
+
+    function historyRunCard(tab, run, { live = false } = {}) {
+      const runId = resultRunId(run)
+      return `
+        <article class="mrm-run-card">
+          <div class="mrm-run-head">
+            <div>
+              <strong>${h(live ? "Текущий предпросмотр" : operationRunTitle(run))}</strong>
+              <span class="mrm-hint">${h(runId ? `run_id: ${runId}` : "")}</span>
+            </div>
+            ${run.status ? statusPill(run.status) : ""}
+          </div>
+          ${summaryRows(operationRunSummaryRows(tab, run))}
+          <details>
+            <summary>Вывод запуска</summary>
+            ${operationRunDetails(tab, run)}
+          </details>
+        </article>
+      `
+    }
+
+    function currentLiveRunForTab(tab) {
+      if (!state.lastBatch || operationTabForResult(state.lastBatch) !== tab) return null
+      return state.lastBatch
+    }
+
+    function operationHistoryPanel(tab) {
+      const runs = state.operationHistory?.[tab]?.runs || []
+      const live = currentLiveRunForTab(tab)
+      const runIds = new Set(runs.map(resultRunId))
+      const liveHtml = live && !runIds.has(resultRunId(live)) ? historyRunCard(tab, live, { live: true }) : ""
+      return `
+        <div class="mrm-run-list">
+          <div class="mrm-result-head">
+            <div><strong>История: ${h(operationTabLabel(tab))}</strong></div>
+          </div>
+          ${liveHtml}
+          ${runs.length ? runs.map((run) => historyRunCard(tab, run)).join("") : `<div class="mrm-empty">Запусков этой операции ещё нет.</div>`}
+        </div>
+      `
+    }
+
+    function operationLog() {
+      const log = state.operationHistory?.log || []
+      if (!log.length) return `<div class="mrm-empty">Для этого мониторинга ещё нет запусков операций.</div>`
+      return `
+        <div class="mrm-table-wrap">
+          <table class="mrm-table">
+            <thead><tr><th>Когда</th><th>Операция</th><th>Кем</th><th>Статус</th><th>run_id</th></tr></thead>
+            <tbody>
+              ${log
+                .map(
+                  (item) => `
+                    <tr>
+                      <td>${h(runDate(item.started_at || item.created_at))}</td>
+                      <td>${h(operationLabels[item.operation_type] || operationTabLabel(item.tab))}</td>
+                      <td>${h(item.created_by || "—")}</td>
+                      <td>${statusPill(item.status || "unknown")}</td>
+                      <td class="is-wrap">${h(item.run_id || "")}</td>
+                    </tr>
+                  `,
+                )
+                .join("")}
+            </tbody>
+          </table>
+        </div>
+      `
+    }
+
+    function operationActionPanel(tab) {
+      if (tab === "folders") {
+        return `
+          <div class="mrm-op-card">
+            <span>Папки организаций</span>
+            <strong>Создать папки для всех</strong>
+            <p>Для выбранных ОУ будут созданы нужные папки в структуре мониторинга.</p>
+            <div class="mrm-actions"><button class="mrm-button" type="button" data-op="folders-preview">Preview</button><button class="mrm-button primary" type="button" data-op="folders-apply">Создать</button></div>
+          </div>
+        `
+      }
+      if (tab === "links") {
+        return `
+          <div class="mrm-op-card">
+            <span>Публикация</span>
+            <strong>Ссылки для загрузки</strong>
+            <p>Создаёт публичные ссылки по выбранному режиму мониторинга и обновляет письма организаций.</p>
+            <div class="mrm-actions">
+              <button class="mrm-button" type="button" data-op="shares-preview">Preview</button>
+              <button class="mrm-button primary" type="button" data-op="shares-apply">Создать ссылки</button>
+              <button class="mrm-button danger" type="button" data-op="shares-delete-all">Удалить все ссылки</button>
+            </div>
+          </div>
+        `
+      }
+      if (tab === "scan") {
+        return `
+          <div class="mrm-op-card">
+            <span>Проверка</span>
+            <strong>Очистка от дублей и мусора</strong>
+            <p>Проверяет загруженные файлы, переносит лишнее и нормализует имена актуальных файлов.</p>
+            <div class="mrm-actions"><button class="mrm-button" type="button" data-op="scan-preview">Проверить файлы</button><button class="mrm-button primary" type="button" data-op="scan-apply">Сохранить результат</button></div>
+          </div>
+        `
+      }
+      if (tab === "messages") return messagesCard()
+      if (tab === "rename") {
+        return `
+          <div class="mrm-op-card">
+            <span>Массовые операции</span>
+            <strong>Переименование</strong>
+            <p>Меняет имена загруженных файлов по шаблону с алиасом и номером ОУ.</p>
+            <div class="mrm-field">
+              <label>Шаблон имени</label>
+              <input data-rename-template value="${h(state.renameTemplate)}" placeholder="текст {алиас} {номер} текст">
+            </div>
+            <div class="mrm-actions">
+              <button class="mrm-button" type="button" data-op="rename-preview">Preview</button>
+              <button class="mrm-button primary" type="button" data-op="rename-apply">Переименовать файлы</button>
+            </div>
+          </div>
+        `
+      }
+      return ""
+    }
+
+    function operationTabContent(tab, campaign) {
+      if (!campaign) return `<div class="mrm-empty">Выберите мониторинг.</div>`
+      if (tab === "log") return operationLog()
+      return `
+        <div class="mrm-operation-layout">
+          <div>${operationActionPanel(tab)}</div>
+          ${operationHistoryPanel(tab)}
+        </div>
+      `
     }
 
     function messagesCard() {
@@ -871,7 +1411,7 @@
               <button class="mrm-button" type="button" data-download="messages.xlsx:${h(batch.id)}">Скачать XLSX</button>
               <button class="mrm-button" type="button" data-download="messages.txt:${h(batch.id)}">Скачать TXT</button>
               <button class="mrm-button" type="button" data-op="messages-open">Открыть письма</button>
-              <button class="mrm-button primary" type="button" data-op="messages-send">Отправить / Подготовить рассылку</button>
+              <button class="mrm-button primary" type="button" data-op="messages-send">Подготовить и отправить</button>
             </div>
           </div>
         `
@@ -891,6 +1431,7 @@
 
     function operations() {
       const campaign = state.campaigns.find((item) => item.id === state.selectedCampaignId)
+      const activeTab = allowedOperationTabs.includes(state.operationTab) ? state.operationTab : "log"
       return shell(
         `
         <section class="mrm-grid">
@@ -902,52 +1443,20 @@
               </select>
             </div>
             <div class="mrm-panel-body">
-              <div class="mrm-operation-grid">
-                <div class="mrm-op-card">
-                  <span>Папки организаций</span>
-                  <strong>Создать папки для всех</strong>
-                  <p>Для всех выбранных ОУ будет создана папка с номером в корне папки мониторинга. Если выбрано несколько типов ОУ - они будут разбиты на группы.</p>
-                  <div class="mrm-actions"><button class="mrm-button" type="button" data-op="folders-preview">Preview</button><button class="mrm-button primary" type="button" data-op="folders-apply">Создать</button></div>
+              <div class="mrm-list-tools">
+                <div class="mrm-segmented" role="tablist" aria-label="Операции мониторинга">
+                  ${operationTabs
+                    .map(([id, label]) => `<button class="${activeTab === id ? "is-active" : ""}" type="button" data-operation-tab="${h(id)}">${h(label)}</button>`)
+                    .join("")}
                 </div>
-                <div class="mrm-op-card">
-                  <span>Публикация</span>
-                  <strong>Ссылки для загрузки</strong>
-                  <p>Создаёт для каждой папки ОУ публичную upload-ссылку и готовит таблицу с их перечислением. Для работы требуется создать папки в первой операции.</p>
-                  <div class="mrm-actions"><button class="mrm-button" type="button" data-op="shares-preview">Preview</button><button class="mrm-button primary" type="button" data-op="shares-apply">Создать ссылки</button></div>
-                </div>
-                <div class="mrm-op-card">
-                  <span>Проверка</span>
-                  <strong>Очистка от дублей и мусора</strong>
-                  <p>Переносит невалидные файлы в мусор и более старые копии в дубли, переименовывает актуальные файлы.</p>
-                  <div class="mrm-actions"><button class="mrm-button" type="button" data-op="scan-preview">Проверить файлы</button><button class="mrm-button primary" type="button" data-op="scan-apply">Сохранить результат</button></div>
-                </div>
-                ${messagesCard()}
-                <div class="mrm-op-card">
-                  <span>Массовые операции</span>
-                  <strong>Переименование</strong>
-                  <p>Меняйте массово имена для загруженных файлов по заданному вами шаблону.</p>
-                  <div class="mrm-field">
-                    <label>Шаблон имени</label>
-                    <input data-rename-template value="${h(state.renameTemplate)}" placeholder="текст {алиас} {номер} текст">
-                  </div>
-                  <div class="mrm-actions">
-                    <button class="mrm-button" type="button" data-op="rename-preview">Preview</button>
-                    <button class="mrm-button primary" type="button" data-op="rename-apply">Переименовать файлы</button>
-                  </div>
+                <div class="mrm-actions">
+                  <button class="mrm-button" type="button" data-download="campaign-links.xlsx">Ссылки XLSX</button>
+                  <button class="mrm-button" type="button" data-download="campaign-report.xlsx">Отчёт XLSX</button>
+                  <button class="mrm-button" type="button" data-download="campaign-message.txt">Текст</button>
                 </div>
               </div>
+              <div class="mrm-operation-view">${operationTabContent(activeTab, campaign)}</div>
             </div>
-          </div>
-          <div class="mrm-panel">
-            <div class="mrm-panel-header">
-              <h3>Результат последней операции</h3>
-              <div class="mrm-actions">
-                <button class="mrm-button" type="button" data-download="campaign-links.xlsx">Ссылки XLSX</button>
-                <button class="mrm-button" type="button" data-download="campaign-report.xlsx">Отчёт XLSX</button>
-                <button class="mrm-button" type="button" data-download="campaign-message.txt">Текст</button>
-              </div>
-            </div>
-            <div class="mrm-panel-body">${operationResult()}</div>
           </div>
         </section>
         `,
@@ -977,7 +1486,9 @@
       }
       if (data.selected_org_types && !Array.isArray(data.selected_org_types)) data.selected_org_types = [data.selected_org_types]
       if (!data.selected_org_types && form.dataset.form === "campaign") data.selected_org_types = []
+      if (form.dataset.form === "campaign" && data.upload_mode !== "organization") data.org_folder_layout = "auto"
       if (data.allowed_extensions) data.allowed_extensions = String(data.allowed_extensions).split(",").map((item) => item.trim()).filter(Boolean)
+      if (!data.allowed_extensions && form.dataset.form === "campaign") data.allowed_extensions = []
       if (data.default_extensions) data.default_extensions = String(data.default_extensions).split(",").map((item) => item.trim()).filter(Boolean)
       if (form.dataset.form === "settings") data.collaboration_group = form.elements.collaboration_group?.value.trim() || ""
       if (form.dataset.form === "organization") {
@@ -1023,12 +1534,26 @@
       URL.revokeObjectURL(url)
     }
 
+    async function loadGroups({ force = false } = {}) {
+      if (state.groupsLoading || (state.groupsLoaded && !force)) return
+      state.groupsLoading = true
+      try {
+        const result = await api("/settings/groups")
+        state.groups = result.items || []
+        state.groupsLoaded = true
+      } finally {
+        state.groupsLoading = false
+        render()
+      }
+    }
+
     async function runOperation(op) {
       if (!state.selectedCampaignId) {
         setNotice("Выберите мониторинг", true)
         return
       }
       const id = state.selectedCampaignId
+      if (op === "shares-delete-all" && !window.confirm("Удалить все публичные ссылки этого мониторинга? Письма с этими ссылками будут очищены.")) return
       const withJson = (payload) => ({ body: JSON.stringify(payload) })
       const renamePayload = () => {
         const template = (root.querySelector("[data-rename-template]")?.value || state.renameTemplate || "").trim()
@@ -1064,7 +1589,12 @@
           phase: "apply",
           preview: "shares-preview",
           path: (batchId) => `/campaigns/${id}/create-shares/apply?batch_id=${encodeURIComponent(batchId)}`,
-          options: { body: JSON.stringify({ public_upload: true }) },
+          options: {},
+        },
+        "shares-delete-all": {
+          phase: "direct",
+          path: `/campaigns/${id}/shares/delete-all`,
+          options: {},
         },
         "scan-preview": {
           kind: "scan",
@@ -1116,6 +1646,49 @@
           options: (batchId) => withJson({ ...renamePayload(), batch_id: batchId }),
         },
       }
+      const currentMessageBatch = () => {
+        if (state.lastBatch?.operation_type === "messages") return state.lastBatch
+        return state.operationState.message_batch || null
+      }
+      const finishOperationView = async () => {
+        await loadBase()
+        state.view = "operations"
+        persistUiState()
+        render()
+      }
+      if (op === "messages-open") {
+        const batchId = messageBatchId(currentMessageBatch())
+        state.lastBatch = batchId
+          ? await api(`/message-batches/${encodeURIComponent(batchId)}`, { method: "POST" })
+          : await api(`/campaigns/${id}/messages/preview`, { method: "POST" })
+        state.operationTab = "messages"
+        setNotice("Готово")
+        await finishOperationView()
+        return
+      }
+      if (op === "messages-send") {
+        let batch = currentMessageBatch()
+        const completedStatuses = ["completed", "completed_with_errors", "failed", "cancelled"]
+        if (!messageBatchId(batch) || completedStatuses.includes(batch.status)) {
+          state.lastBatch = await api(`/campaigns/${id}/messages/prepare-send`, { method: "POST" })
+          state.operationTab = "messages"
+          setNotice((state.lastBatch.summary?.pending || 0) > 0 ? "Отправка запущена" : "Нет писем, готовых к отправке", (state.lastBatch.summary?.pending || 0) <= 0)
+          await finishOperationView()
+          return
+        }
+        if ((batch.summary?.pending || 0) <= 0) {
+          state.lastBatch = batch
+          state.operationTab = "messages"
+          setNotice("Нет писем, готовых к отправке", true)
+          await finishOperationView()
+          return
+        }
+        state.lastBatch = await api(`/message-batches/${encodeURIComponent(messageBatchId(batch))}/send`, { method: "POST" })
+        state.operationTab = "messages"
+        setNotice("Отправка запущена")
+        await finishOperationView()
+        return
+      }
       const runConfigured = async (operation) => {
         const path = typeof operation.path === "function" ? operation.path(state.operationBatches[operation.kind]) : operation.path
         const options = typeof operation.options === "function" ? operation.options(state.operationBatches[operation.kind]) : operation.options
@@ -1129,11 +1702,15 @@
       if (operation.phase === "apply" && !state.operationBatches[operation.kind]) {
         await runConfigured(operations[operation.preview])
       }
-      await runConfigured(operation)
+      const result = await runConfigured(operation)
+      const resultTab = operationTabForResult(result)
+      if (resultTab) state.operationTab = resultTab
       if (operation.phase === "apply") delete state.operationBatches[operation.kind]
+      if (op === "shares-delete-all") delete state.operationBatches.shares
       setNotice("Готово")
       await loadBase()
       state.view = "operations"
+      persistUiState()
       render()
     }
 
@@ -1150,6 +1727,7 @@
           setNotice("Мониторинг перемещён")
           await loadBase()
           state.view = "campaigns"
+          persistUiState()
           render()
         },
       })
@@ -1168,24 +1746,55 @@
       setNotice("Мониторинг перемещён в архив")
       await loadBase()
       state.view = "campaigns"
+      persistUiState()
       render()
     }
 
     root.addEventListener("click", async (event) => {
+      const extensionPickerElement = event.target.closest("[data-extension-picker]")
+      if (!extensionPickerElement) {
+        closeExtensionPickers()
+      }
+      const extensionRemove = event.target.closest("[data-extension-remove]")
+      if (extensionRemove && extensionPickerElement) {
+        const value = extensionRemove.dataset.extensionRemove
+        setExtensionValues(extensionPickerElement, selectedExtensionValues(extensionPickerElement).filter((item) => item !== value))
+        toggleExtensionPicker(extensionPickerElement, true)
+        return
+      }
+      const extensionOption = event.target.closest("[data-extension-option]")
+      if (extensionOption && extensionPickerElement) {
+        const value = extensionOption.dataset.extensionOption
+        const selected = selectedExtensionValues(extensionPickerElement)
+        const next = selected.includes(value) ? selected.filter((item) => item !== value) : [...selected, value]
+        setExtensionValues(extensionPickerElement, next)
+        toggleExtensionPicker(extensionPickerElement, true)
+        return
+      }
+      if (event.target.closest("[data-extension-control]") && extensionPickerElement) {
+        closeExtensionPickers(extensionPickerElement)
+        toggleExtensionPicker(extensionPickerElement)
+        return
+      }
       const target = event.target.closest("button")
       if (!target) return
       try {
         if (target.dataset.view) {
           state.view = target.dataset.view
+          persistUiState()
           render()
         } else if (target.dataset.selectCampaign) {
+          const title = campaignTitle(target.dataset.selectCampaign)
           if (state.selectedCampaignId !== target.dataset.selectCampaign) state.operationBatches = {}
           state.selectedCampaignId = target.dataset.selectCampaign
           state.view = "operations"
-          render()
+          persistUiState()
+          await loadBase()
+          setNotice(`Загружен ${title} мониторинг`)
         } else if (target.dataset.editOrganization) {
           state.editingOrganizationId = target.dataset.editOrganization
           state.view = "organizations"
+          persistUiState()
           render()
         } else if (target.dataset.cancelOrganization !== undefined) {
           state.editingOrganizationId = ""
@@ -1193,16 +1802,24 @@
         } else if (target.dataset.editCampaign) {
           state.editingCampaignId = target.dataset.editCampaign
           state.view = "campaigns"
+          persistUiState()
           render()
+          setNotice(`Мониторинг ${campaignTitle(target.dataset.editCampaign)} загружен на редактирование`)
         } else if (target.dataset.moveCampaign) {
           await moveCampaignWithPicker(target.dataset.moveCampaign)
         } else if (target.dataset.archiveCampaign) {
           await archiveCampaign(target.dataset.archiveCampaign)
         } else if (target.dataset.cancelCampaign !== undefined) {
+          const title = campaignTitle(state.editingCampaignId)
           state.editingCampaignId = ""
           render()
+          setNotice(`Изменения для мониторинга ${title} отменены`, true)
         } else if (target.dataset.orgFilter) {
           state.organizationFilter = target.dataset.orgFilter
+          render()
+        } else if (target.dataset.operationTab) {
+          state.operationTab = target.dataset.operationTab
+          persistUiState()
           render()
         } else if (target.dataset.deleteOrganization) {
           if (!window.confirm("Удалить запись из общего справочника?")) return
@@ -1223,6 +1840,12 @@
                 ? "общая папка"
                 : "папка владельца"
           setNotice(`Корень доступен: ${mode}`)
+        } else if (target.dataset.testMail !== undefined) {
+          const result = await api("/settings/test-mail", { method: "POST" })
+          setNotice(`Тестовое письмо отправлено: ${result.email}`)
+        } else if (target.dataset.loadGroups !== undefined) {
+          await loadGroups({ force: true })
+          setNotice("Список групп обновлён")
         } else if (target.dataset.download) {
           await download(target.dataset.download)
         } else if (target.dataset.op) {
@@ -1237,11 +1860,16 @@
       if (event.target.matches("[data-selected-campaign]")) {
         if (state.selectedCampaignId !== event.target.value) state.operationBatches = {}
         state.selectedCampaignId = event.target.value
-        render()
+        persistUiState()
+        await loadBase()
+        setNotice(`Загружен ${campaignTitle(event.target.value)} мониторинг`)
       }
       if (event.target.matches("[data-org-type-select]")) {
         const input = event.target.closest("form")?.querySelector("[data-org-aliases]")
         if (input && (!input.value.trim() || isDefaultAliasText(input.value))) input.value = aliasText(defaultAliasesForType(event.target.value))
+      }
+      if (event.target.matches('select[name="upload_mode"]')) {
+        syncCampaignStructureControls(event.target.closest("form"))
       }
       if (event.target.matches("[data-import-organizations]") && event.target.files[0]) {
         const file = event.target.files[0]
@@ -1267,6 +1895,34 @@
       }
     })
 
+    root.addEventListener("pointerdown", (event) => {
+      if (event.target.matches("[data-group-select]")) {
+        void loadGroups().catch((error) => setNotice(error.message, true))
+      }
+    })
+
+    root.addEventListener("focusin", (event) => {
+      if (event.target.matches("[data-group-select]")) {
+        void loadGroups().catch((error) => setNotice(error.message, true))
+      }
+    })
+
+    root.addEventListener("keydown", (event) => {
+      const control = event.target.closest("[data-extension-control]")
+      if (!control) return
+      const picker = control.closest("[data-extension-picker]")
+      if (!picker) return
+      if (event.key === "Escape") {
+        toggleExtensionPicker(picker, false)
+        return
+      }
+      if (event.key === "Enter" || event.key === " ") {
+        event.preventDefault()
+        closeExtensionPickers(picker)
+        toggleExtensionPicker(picker)
+      }
+    })
+
     root.addEventListener("input", (event) => {
       if (event.target.matches("[data-rename-template]")) {
         state.renameTemplate = event.target.value
@@ -1278,6 +1934,7 @@
     root.addEventListener("submit", async (event) => {
       event.preventDefault()
       const form = event.target
+      let resetForm = true
       try {
         if (form.dataset.form === "organization") {
           const payload = jsonFromForm(form)
@@ -1292,8 +1949,9 @@
         } else if (form.dataset.form === "campaign") {
           const payload = jsonFromForm(form)
           if (state.editingCampaignId) {
+            const title = payload.title || campaignTitle(state.editingCampaignId)
             await api(`/campaigns/${encodeURIComponent(state.editingCampaignId)}`, { method: "PUT", body: JSON.stringify(payload) })
-            setNotice("Мониторинг обновлён")
+            setNotice(`Мониторинг ${title} изменён`)
             state.editingCampaignId = ""
           } else {
             await api("/campaigns", { method: "POST", body: JSON.stringify(payload) })
@@ -1301,10 +1959,13 @@
           }
         } else if (form.dataset.form === "settings") {
           const payload = jsonFromForm(form)
-          await api("/settings", { method: "PUT", body: JSON.stringify(payload) })
+          const saved = await api("/settings", { method: "PUT", body: JSON.stringify(payload) })
+          state.settings = saved
+          resetForm = false
           setNotice("Настройки сохранены")
+          render()
         }
-        form.reset()
+        if (resetForm) form.reset()
         await loadBase()
       } catch (error) {
         setNotice(error.message, true)

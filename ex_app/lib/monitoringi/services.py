@@ -17,8 +17,10 @@ from .models import (
     AuditLog,
     BatchStatus,
     Campaign,
+    CampaignOrgLayout,
     CampaignOrganization,
     CampaignOrganizationStatus,
+    CampaignUploadMode,
     FileClassification,
     FileRecord,
     OperationAction,
@@ -115,7 +117,35 @@ def campaign_type_values(campaign: Campaign, organizations: list[Organization] |
     return sorted(values, key=lambda item: ORGANIZATION_TYPE_ORDER.index(item) if item in ORGANIZATION_TYPE_ORDER else len(ORGANIZATION_TYPE_ORDER))
 
 
+def campaign_upload_mode(campaign: Campaign) -> str:
+    value = getattr(campaign, "upload_mode", None)
+    text = str(value.value if hasattr(value, "value") else value or CampaignUploadMode.organization.value)
+    allowed = {item.value for item in CampaignUploadMode}
+    return text if text in allowed else CampaignUploadMode.organization.value
+
+
+def campaign_org_layout(campaign: Campaign) -> str:
+    value = getattr(campaign, "org_folder_layout", None)
+    text = str(value.value if hasattr(value, "value") else value or CampaignOrgLayout.auto.value)
+    allowed = {item.value for item in CampaignOrgLayout}
+    return text if text in allowed else CampaignOrgLayout.auto.value
+
+
+def campaign_uses_organization_folders(campaign: Campaign) -> bool:
+    return campaign_upload_mode(campaign) == CampaignUploadMode.organization.value
+
+
 def campaign_uses_type_folders(campaign: Campaign, organizations: list[Organization] | None = None) -> bool:
+    mode = campaign_upload_mode(campaign)
+    if mode == CampaignUploadMode.campaign_root.value:
+        return False
+    if mode == CampaignUploadMode.org_type.value:
+        return bool(campaign_type_values(campaign, organizations))
+    layout = campaign_org_layout(campaign)
+    if layout == CampaignOrgLayout.flat.value:
+        return False
+    if layout == CampaignOrgLayout.by_type.value:
+        return bool(campaign_type_values(campaign, organizations))
     return len(campaign_type_values(campaign, organizations)) > 1
 
 
@@ -361,10 +391,50 @@ def organization_folder_name(organization: Organization) -> str:
     return organization.code or organization.display_name
 
 
+def campaign_type_folder_path(campaign: Campaign, type_value: Any) -> str:
+    return join_nc_path(campaign.campaign_folder_path, organization_type_label(type_value))
+
+
 def campaign_organization_folder_path(campaign: Campaign, organization: Organization, *, use_type_folder: bool) -> str:
     if use_type_folder:
-        return join_nc_path(campaign.campaign_folder_path, organization_type_label(organization_type_value(organization)), organization_folder_name(organization))
+        return join_nc_path(campaign_type_folder_path(campaign, organization_type_value(organization)), organization_folder_name(organization))
     return organization_folder_path(campaign.campaign_folder_path, organization_folder_name(organization))
+
+
+def campaign_organization_upload_path(
+    campaign: Campaign,
+    organization: Organization,
+    organizations: list[Organization] | None = None,
+) -> str:
+    mode = campaign_upload_mode(campaign)
+    if mode == CampaignUploadMode.campaign_root.value:
+        return campaign.campaign_folder_path
+    if mode == CampaignUploadMode.org_type.value:
+        return campaign_type_folder_path(campaign, organization_type_value(organization))
+    return campaign_organization_folder_path(
+        campaign,
+        organization,
+        use_type_folder=campaign_uses_type_folders(campaign, organizations),
+    )
+
+
+def _assign_campaign_org_path(
+    item: CampaignOrganization,
+    folder_path: str,
+    *,
+    reset_links_on_change: bool = True,
+) -> None:
+    if item.folder_path == folder_path:
+        return
+    item.folder_path = folder_path
+    if reset_links_on_change:
+        item.share_id = None
+        item.public_link = None
+        item.mail_subject = None
+        item.mail_body = None
+        if item.status != CampaignOrganizationStatus.pending:
+            item.status = CampaignOrganizationStatus.pending
+    item.updated_at = utcnow()
 
 
 def create_campaign_orgs(session: Session, campaign: Campaign, organizations: list[Organization]) -> list[CampaignOrganization]:
@@ -373,15 +443,13 @@ def create_campaign_orgs(session: Session, campaign: Campaign, organizations: li
         for item in session.exec(select(CampaignOrganization).where(CampaignOrganization.campaign_id == campaign.id)).all()
     }
     result: list[CampaignOrganization] = []
-    use_type_folder = campaign_uses_type_folders(campaign, organizations)
     for org in organizations:
-        folder_path = campaign_organization_folder_path(campaign, org, use_type_folder=use_type_folder)
+        folder_path = campaign_organization_upload_path(campaign, org, organizations)
         item = existing.get(org.id)
         if item is None:
             item = CampaignOrganization(campaign_id=campaign.id, organization_id=org.id, folder_path=folder_path)
         else:
-            item.folder_path = folder_path
-            item.updated_at = utcnow()
+            _assign_campaign_org_path(item, folder_path)
         session.add(item)
         result.append(item)
     session.commit()
@@ -394,14 +462,19 @@ def sync_campaign_orgs(session: Session, campaign: Campaign, organizations: list
         for item in session.exec(select(CampaignOrganization).where(CampaignOrganization.campaign_id == campaign.id)).all()
     }
     changed = False
-    use_type_folder = campaign_uses_type_folders(campaign, organizations)
     for org in organizations:
+        folder_path = campaign_organization_upload_path(campaign, org, organizations)
         if org.id in existing:
+            before = existing[org.id].folder_path
+            _assign_campaign_org_path(existing[org.id], folder_path)
+            if existing[org.id].folder_path != before:
+                session.add(existing[org.id])
+                changed = True
             continue
         item = CampaignOrganization(
             campaign_id=campaign.id,
             organization_id=org.id,
-            folder_path=campaign_organization_folder_path(campaign, org, use_type_folder=use_type_folder),
+            folder_path=folder_path,
         )
         session.add(item)
         existing[org.id] = item
@@ -500,6 +573,60 @@ async def apply_batch(session: Session, batch: OperationBatch, client: Nextcloud
     return batch
 
 
+def campaign_share_targets(
+    campaign: Campaign,
+    campaign_orgs: list[CampaignOrganization],
+    organizations: list[Organization] | None = None,
+) -> list[dict[str, Any]]:
+    org_by_id = {org.id: org for org in organizations or []}
+    mode = campaign_upload_mode(campaign)
+    linked_items = [item for item in campaign_orgs if item.organization_id in org_by_id or not org_by_id]
+    if mode == CampaignUploadMode.campaign_root.value:
+        if not linked_items:
+            return []
+        return [
+            {
+                "scope": CampaignUploadMode.campaign_root.value,
+                "target_path": campaign.campaign_folder_path,
+                "label": "Корень мониторинга",
+                "campaign_org_ids": [item.id for item in linked_items],
+            }
+        ]
+    if mode == CampaignUploadMode.org_type.value:
+        grouped: dict[str, list[str]] = {}
+        for item in campaign_orgs:
+            org = org_by_id.get(item.organization_id)
+            if org is None:
+                continue
+            grouped.setdefault(organization_type_value(org), []).append(item.id)
+        result: list[dict[str, Any]] = []
+        for type_value in campaign_type_values(campaign, organizations):
+            ids = grouped.get(type_value) or []
+            if not ids:
+                continue
+            result.append(
+                {
+                    "scope": CampaignUploadMode.org_type.value,
+                    "target_path": campaign_type_folder_path(campaign, type_value),
+                    "label": organization_type_label(type_value),
+                    "organization_type": type_value,
+                    "organization_type_folder": organization_type_label(type_value),
+                    "campaign_org_ids": ids,
+                }
+            )
+        return result
+    return [
+        {
+            "scope": CampaignUploadMode.organization.value,
+            "target_path": item.folder_path,
+            "label": item.folder_path,
+            "campaign_org_ids": [item.id],
+            "organization_id": item.organization_id,
+        }
+        for item in campaign_orgs
+    ]
+
+
 def planned_folder_items(
     campaign: Campaign,
     campaign_orgs: list[CampaignOrganization],
@@ -512,7 +639,7 @@ def planned_folder_items(
     if use_type_folder:
         for type_value in campaign_type_values(campaign, organizations):
             type_folder = organization_type_label(type_value)
-            target_path = join_nc_path(campaign.campaign_folder_path, type_folder)
+            target_path = campaign_type_folder_path(campaign, type_value)
             if existing_folder_paths is not None and target_path in existing_folder_paths:
                 continue
             items.append(
@@ -523,9 +650,11 @@ def planned_folder_items(
                     "metadata_json": {"organization_type": type_value, "organization_type_folder": type_folder},
                 }
             )
+    if not campaign_uses_organization_folders(campaign):
+        return items
     for item in campaign_orgs:
         org = org_by_id.get(item.organization_id)
-        desired_path = campaign_organization_folder_path(campaign, org, use_type_folder=use_type_folder) if org else item.folder_path
+        desired_path = campaign_organization_upload_path(campaign, org, organizations) if org else item.folder_path
         metadata = {"campaign_org_id": item.id, "organization_id": item.organization_id}
         if org:
             metadata.update(

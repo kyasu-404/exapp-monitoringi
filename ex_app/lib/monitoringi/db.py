@@ -44,12 +44,23 @@ def get_engine():
     return _engine
 
 
+def _ensure_campaign_columns(session: Session) -> None:
+    if not SETTINGS.database_url.startswith("sqlite"):
+        return
+    columns = {row[1] for row in session.exec(text("PRAGMA table_info(campaign)")).all()}
+    if "upload_mode" not in columns:
+        session.exec(text("ALTER TABLE campaign ADD COLUMN upload_mode VARCHAR DEFAULT 'organization' NOT NULL"))
+    if "org_folder_layout" not in columns:
+        session.exec(text("ALTER TABLE campaign ADD COLUMN org_folder_layout VARCHAR DEFAULT 'auto' NOT NULL"))
+
+
 def init_db() -> None:
     if SETTINGS.database_url.startswith("sqlite:///"):
         db_path = Path(SETTINGS.database_url.removeprefix("sqlite:///"))
         db_path.parent.mkdir(parents=True, exist_ok=True)
     SQLModel.metadata.create_all(get_engine())
     with Session(get_engine()) as session:
+        _ensure_campaign_columns(session)
         session.exec(text("CREATE UNIQUE INDEX IF NOT EXISTS uq_organization_type_code ON organization (type, code)"))
         default_template = session.exec(select(MailTemplate).where(MailTemplate.is_default == True)).first()  # noqa: E712
         if default_template is None:

@@ -25,7 +25,7 @@ def _safe_asset(root: Path, path: str, media_type: str | None = None) -> FileRes
         raise HTTPException(status_code=404)
     if not target.is_file():
         raise HTTPException(status_code=404)
-    return FileResponse(target, media_type=media_type)
+    return FileResponse(target, media_type=media_type, headers={"Cache-Control": "no-store"})
 
 
 @asynccontextmanager
@@ -64,6 +64,8 @@ async def index() -> HTMLResponse:
   <script src="js/monitoringi-main.js"></script>
 </body>
 </html>"""
+        ,
+        headers={"Cache-Control": "no-store"},
     )
 
 
