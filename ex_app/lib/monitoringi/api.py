@@ -5,13 +5,24 @@ from __future__ import annotations
 import asyncio
 import base64
 import binascii
+import re
 from pathlib import PurePosixPath
 from typing import Annotated, Any
+from urllib.parse import quote
 
 from fastapi import APIRouter, BackgroundTasks, Depends, File, HTTPException, Query, Request, Response, UploadFile
 from sqlmodel import Session, delete, select
 
-from .algorithms import classify_files, effective_organization_aliases, normalize_filename, normalize_text, normalized_organization_file_stem, organization_sort_key
+from .algorithms import (
+    ClassifiedFile,
+    FileCandidate,
+    classify_files,
+    effective_organization_aliases,
+    normalize_filename,
+    normalize_text,
+    normalized_organization_file_stem,
+    organization_sort_key,
+)
 from .db import get_engine, get_session
 from .errors import AppError
 from .models import (
@@ -24,7 +35,6 @@ from .models import (
     FileClassification,
     FileRecord,
     MailItemStatus,
-    MailTemplate,
     MessageBatch,
     MessageItem,
     OperationAction,
@@ -36,7 +46,7 @@ from .models import (
     utcnow,
 )
 from .nextcloud import NextcloudClient, configured_credentials
-from .reports import LINK_COLUMNS, MAILING_COLUMNS, csv_bytes, link_rows, mailing_rows, missing_message, report_workbook, xlsx_bytes
+from .reports import MAILING_COLUMNS, csv_bytes, link_columns, link_rows, mailing_rows, missing_message, report_workbook, xlsx_bytes
 from .schemas import (
     BulkPathsIn,
     CampaignIn,
@@ -68,7 +78,7 @@ from .services import (
     current_user_id,
     deadline_storage,
     entries_to_candidates,
-    mail_values_for_campaign_org,
+    missing_file_mail_values,
     missing_by_type,
     missing_organizations,
     nextcloud_overrides,
@@ -80,6 +90,7 @@ from .services import (
     settings_map,
     sync_campaign_orgs,
     target_invalid_path,
+    upload_link_mail_values,
     update_settings,
     validate_organization_rows,
 )
@@ -95,6 +106,7 @@ ROOT_REQUIRED_PERMISSIONS = {"G", "C", "K"}
 GROUP_SHARE_PERMISSIONS = 31
 PUBLIC_FILE_REQUEST_PERMISSIONS = 4
 PUBLIC_EDIT_PERMISSIONS = 15
+UNSAFE_DOWNLOAD_FILENAME_CHARS = re.compile(r'[\x00-\x1f<>:"/\\|?*]+')
 
 
 def _user(request: Request) -> str | None:
@@ -114,6 +126,18 @@ def _raise(exc: AppError) -> None:
 
 def _model_json(model) -> dict[str, Any]:
     return model.model_dump(mode="json")
+
+
+def _download_filename(prefix: str, campaign: Campaign, extension: str) -> str:
+    title = UNSAFE_DOWNLOAD_FILENAME_CHARS.sub("_", str(campaign.title or "").strip()).strip(" .")
+    title = title or campaign.id
+    return f"{prefix}-{title}.{extension.lstrip('.')}"
+
+
+def _download_disposition(prefix: str, campaign: Campaign, extension: str) -> str:
+    filename = _download_filename(prefix, campaign, extension)
+    ascii_fallback = f"{prefix}.{extension.lstrip('.')}"
+    return f"attachment; filename=\"{ascii_fallback}\"; filename*=UTF-8''{quote(filename, safe='')}"
 
 
 def _effective_org_folder_layout(upload_mode: str, org_folder_layout: str | None) -> str:
@@ -419,18 +443,46 @@ async def _find_moved_campaign_folder(client: NextcloudClient, session: Session,
 
 def _organization_create_data(payload: OrganizationIn) -> dict[str, Any]:
     data = payload.model_dump(mode="json")
-    data["code"] = data["code"].strip()
-    data["display_name"] = (data.get("display_name") or data["code"]).strip()
+    data["aliases"] = aliases_or_type_defaults(data["type"], data.get("aliases"))
+    if data["type"] == "udod":
+        if not data["aliases"]:
+            raise HTTPException(
+                status_code=400,
+                detail={"code": "UDOD_ALIAS_REQUIRED", "message": "Для УДОД укажите хотя бы один алиас."},
+            )
+        data["code"] = data["aliases"][0]
+        data["display_name"] = data["aliases"][0]
+        data["prefix"] = None
+    else:
+        data["code"] = str(data.get("code") or "").strip()
+        if not data["code"]:
+            raise HTTPException(
+                status_code=400,
+                detail={"code": "ORGANIZATION_CODE_REQUIRED", "message": "Номер ОУ не должен быть пустым."},
+            )
+        data["display_name"] = (data.get("display_name") or data["code"]).strip()
     data["short_name"] = data.get("short_name") or data["display_name"]
     data["prefix"] = data.get("prefix") or None
     data["extra_emails"] = data.get("extra_emails") or []
-    data["aliases"] = aliases_or_type_defaults(data["type"], data.get("aliases"))
     data["active"] = data.get("active", True)
     return data
 
 
 def _organization_patch_data(payload: OrganizationPatch, organization: Organization) -> dict[str, Any]:
     data = payload.model_dump(exclude_unset=True, mode="json")
+    next_type = data.get("type", organization.type.value if hasattr(organization.type, "value") else organization.type)
+    if next_type == "udod":
+        aliases = aliases_or_type_defaults(next_type, data.get("aliases", organization.aliases))
+        if not aliases:
+            raise HTTPException(
+                status_code=400,
+                detail={"code": "UDOD_ALIAS_REQUIRED", "message": "Для УДОД укажите хотя бы один алиас."},
+            )
+        data["aliases"] = aliases
+        data["code"] = aliases[0]
+        data["display_name"] = aliases[0]
+        data["short_name"] = aliases[0]
+        data["prefix"] = None
     if "code" in data and data["code"] is not None:
         data["code"] = data["code"].strip()
     if data.get("display_name") is not None:
@@ -441,7 +493,9 @@ def _organization_patch_data(payload: OrganizationPatch, organization: Organizat
         data["display_name"] = data.get("code") or organization.code
     if data.get("short_name") == "":
         data["short_name"] = data.get("display_name") or organization.display_name
-    if "aliases" in data:
+    if next_type == "udod":
+        pass
+    elif "aliases" in data:
         data["aliases"] = aliases_or_type_defaults(data.get("type", organization.type), data.get("aliases"))
     elif "type" in data:
         data["aliases"] = aliases_or_type_defaults(data["type"], [])
@@ -511,13 +565,6 @@ def _organizations_for_campaign(session: Session, campaign: Campaign) -> list[Or
     return session.exec(select(Organization).where(Organization.id.in_(ids))).all()
 
 
-def _default_mail_template(session: Session) -> MailTemplate:
-    template = session.exec(select(MailTemplate).where(MailTemplate.is_default == True)).first()  # noqa: E712
-    if template is None:
-        raise HTTPException(status_code=500, detail={"code": "MAIL_TEMPLATE_MISSING", "message": "Шаблон письма не найден."})
-    return template
-
-
 async def _webdav_folder_exists(client: NextcloudClient, path: str) -> bool:
     try:
         entries = await client.propfind(path, depth=0)
@@ -544,15 +591,19 @@ async def _root_access_status(
 
     permissions = entry.permissions or ""
     missing_permissions = sorted(ROOT_REQUIRED_PERMISSIONS.difference(permissions))
-    mode = "team_folder" if entry.mount_type == "group" else "owner_folder"
+    is_team_folder_root = entry.mount_type == "group" and entry.is_mount_root is True
+    mode = "team_folder" if is_team_folder_root else "owner_folder"
     share_result: dict[str, Any] | None = None
     normalized_root = ensure_under_root(root_path, root_path)
+    missing_group_share = False
+    group_share_permissions: int | None = None
     if entry.mount_type == "shared":
         mode = "received_share"
-    elif entry.mount_type != "group" and group_id:
+    elif entry.mount_type == "group":
+        mode = "team_folder" if is_team_folder_root else "team_folder_child"
+    elif group_id:
         if normalized_root == "/":
             raise AppError("ROOT_SHARE_NOT_SUPPORTED", "Нельзя выдавать группе общий доступ на корень файлов пользователя. Укажите папку, например /Мониторинги.", 400)
-        mode = "group_share_fallback"
         if ensure_share:
             share_result = await client.ensure_group_share(
                 normalized_root,
@@ -561,22 +612,38 @@ async def _root_access_status(
                 label="Сбор файлов ОО",
                 note="Доступ к корневой папке мониторингов",
             )
+            mode = "group_share_fallback"
+            group_share_permissions = GROUP_SHARE_PERMISSIONS
+        else:
+            for share in await client.shares_for_path(normalized_root):
+                share_type = str(share.get("share_type") or share.get("shareType") or "")
+                share_with = str(share.get("share_with") or share.get("shareWith") or "")
+                if share_type == "1" and share_with == group_id:
+                    group_share_permissions = int(share.get("permissions") or 0)
+                    break
+            if group_share_permissions is not None and (group_share_permissions & GROUP_SHARE_PERMISSIONS) == GROUP_SHARE_PERMISSIONS:
+                mode = "group_share_fallback"
+            else:
+                missing_group_share = True
     elif entry.mount_type != "group":
         mode = "owner_folder"
 
     status = "ok"
-    if missing_permissions:
+    if missing_permissions or missing_group_share or mode in {"owner_folder", "received_share", "team_folder_child"}:
         status = "warning"
     return {
         "status": status,
         "path": entry.path,
         "mode": mode,
-        "is_group_folder": entry.mount_type == "group",
+        "is_group_folder": is_team_folder_root,
+        "is_team_folder_root": is_team_folder_root,
         "mount_type": entry.mount_type or "local",
         "is_mount_root": entry.is_mount_root,
         "owner_id": entry.owner_id,
         "permissions": permissions,
         "missing_permissions": missing_permissions,
+        "missing_group_share": missing_group_share,
+        "group_share_permissions": group_share_permissions,
         "collaboration_group": group_id or "",
         "share": share_result,
     }
@@ -892,6 +959,20 @@ def update_organization(
     session.commit()
     session.refresh(organization)
     return _model_json(organization)
+
+
+@router.delete("/organizations")
+def deactivate_all_organizations(session: SessionDep, request: Request) -> dict[str, Any]:
+    organizations = session.exec(select(Organization).where(Organization.active == True)).all()  # noqa: E712
+    now = utcnow()
+    for organization in organizations:
+        organization.active = False
+        organization.updated_at = now
+        session.add(organization)
+    summary = {"status": "deactivated", "count": len(organizations)}
+    audit(session, user_id=_user(request), action="deactivate_all", entity_type="organization", after=summary)
+    session.commit()
+    return summary
 
 
 @router.delete("/organizations/{organization_id}")
@@ -1419,7 +1500,6 @@ async def create_folders_apply(
         success = 0
         failed = 0
         org_by_id = {org.id: org for org in _organizations_for_campaign(session, campaign)}
-        mail_template = _default_mail_template(session)
         try:
             async with NextcloudClient(_nc_credentials(session, request)) as client:
                 items = session.exec(select(OperationItem).where(OperationItem.batch_id == batch.id)).all()
@@ -1465,13 +1545,7 @@ async def create_folders_apply(
                             if campaign_org.public_link and campaign_org.folder_path != old_folder_path:
                                 org = org_by_id.get(campaign_org.organization_id)
                                 if org:
-                                    subject, body = mail_values_for_campaign_org(
-                                        campaign,
-                                        org,
-                                        campaign_org,
-                                        mail_template.subject_template,
-                                        mail_template.body_template,
-                                    )
+                                    subject, body = upload_link_mail_values(campaign, campaign_org)
                                     campaign_org.mail_subject = subject
                                     campaign_org.mail_body = body
                             campaign_org.updated_at = utcnow()
@@ -1519,16 +1593,20 @@ async def create_shares_preview(campaign_id: str, session: SessionDep, request: 
     targets = campaign_share_targets(campaign, campaign_orgs, organizations)
     items = []
     shares_to_create = 0
+    shares_to_update = 0
     mailing_to_refresh = 0
     for target in targets:
         target_orgs = [campaign_org_by_id[item_id] for item_id in target["campaign_org_ids"] if item_id in campaign_org_by_id]
         existing_link = next((item for item in target_orgs if item.public_link), None)
+        share_options = _public_share_options_for_scope(target["scope"])
+        needs_share_update = existing_link is not None and share_options["file_request"]
         needs_mail_refresh = [item for item in target_orgs if not item.public_link or not item.mail_subject or not item.mail_body]
         if existing_link is None:
             shares_to_create += 1
+        elif needs_share_update:
+            shares_to_update += 1
         mailing_to_refresh += len([item for item in target_orgs if item.public_link and (not item.mail_subject or not item.mail_body)])
-        if existing_link is None or needs_mail_refresh:
-            share_options = _public_share_options_for_scope(target["scope"])
+        if existing_link is None or needs_share_update or needs_mail_refresh:
             items.append(
                 {
                     "action": "create_share",
@@ -1548,6 +1626,7 @@ async def create_shares_preview(campaign_id: str, session: SessionDep, request: 
     summary = {
         "share_targets": len(targets),
         "shares_to_create": shares_to_create,
+        "shares_to_update": shares_to_update,
         "mailing_to_refresh": mailing_to_refresh,
         "existing_links": len([item for item in campaign_orgs if item.public_link]),
         **context,
@@ -1569,7 +1648,6 @@ async def create_shares_apply(
     if batch.campaign_id != campaign.id or batch.operation_type != "create_shares":
         raise HTTPException(status_code=400, detail={"code": "INVALID_BATCH", "message": "Пакет операций не подходит для этого мониторинга."})
     options = options or ShareOptionsIn()
-    template = _default_mail_template(session)
     org_by_id = {org.id: org for org in _organizations_for_campaign(session, campaign)}
     campaign_org_by_id = {item.id: item for item in _campaign_orgs(session, campaign)}
     await _ensure_campaign_org_folders_exist(session, request, campaign, list(campaign_org_by_id.values()))
@@ -1627,13 +1705,7 @@ async def create_shares_apply(
                         campaign_org.status = CampaignOrganizationStatus.link_created
                         org = org_by_id.get(campaign_org.organization_id)
                         if org:
-                            subject, body = mail_values_for_campaign_org(
-                                campaign,
-                                org,
-                                campaign_org,
-                                template.subject_template,
-                                template.body_template,
-                            )
+                            subject, body = upload_link_mail_values(campaign, campaign_org)
                             campaign_org.mail_subject = subject
                             campaign_org.mail_body = body
                         campaign_org.updated_at = utcnow()
@@ -1775,10 +1847,11 @@ def campaign_mailing_xlsx(campaign_id: str, session: SessionDep) -> Response:
 def campaign_links_csv(campaign_id: str, session: SessionDep) -> Response:
     campaign = _get_campaign(session, campaign_id)
     rows = link_rows(campaign, _organizations_for_campaign(session, campaign), _campaign_orgs(session, campaign))
+    columns = link_columns(campaign)
     return Response(
-        csv_bytes(rows, LINK_COLUMNS),
+        csv_bytes(rows, columns),
         media_type="text/csv; charset=utf-8",
-        headers={"Content-Disposition": f'attachment; filename="campaign-{campaign_id}-links.csv"'},
+        headers={"Content-Disposition": _download_disposition("links", campaign, "csv")},
     )
 
 
@@ -1786,15 +1859,16 @@ def campaign_links_csv(campaign_id: str, session: SessionDep) -> Response:
 def campaign_links_xlsx(campaign_id: str, session: SessionDep) -> Response:
     campaign = _get_campaign(session, campaign_id)
     rows = link_rows(campaign, _organizations_for_campaign(session, campaign), _campaign_orgs(session, campaign))
+    columns = link_columns(campaign)
     return Response(
-        xlsx_bytes(rows, LINK_COLUMNS, sheet_name="Ссылки"),
+        xlsx_bytes(rows, columns, sheet_name="Ссылки"),
         media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        headers={"Content-Disposition": f'attachment; filename="campaign-{campaign_id}-links.xlsx"'},
+        headers={"Content-Disposition": _download_disposition("links", campaign, "xlsx")},
     )
 
 
 
-def _check_summary(classified, missing: list[Organization], cleanup_summary: dict[str, int] | None = None) -> dict[str, Any]:
+def _check_summary(classified, missing: list[Organization], cleanup_summary: dict[str, Any] | None = None) -> dict[str, Any]:
     summary: dict[str, Any] = {"total": len(classified), "missing": len(missing)}
     for item in classified:
         summary[item.classification] = summary.get(item.classification, 0) + 1
@@ -1804,10 +1878,80 @@ def _check_summary(classified, missing: list[Organization], cleanup_summary: dic
     return summary
 
 
+def _missing_organizations_from_classified(organizations: list[Organization], classified) -> list[Organization]:
+    seen_org_ids = {item.organization_id for item in classified if item.organization_id}
+    return sorted(
+        [org for org in organizations if org.id not in seen_org_ids],
+        key=organization_sort_key,
+    )
+
+
+def _planned_scan_file_operations(campaign: Campaign, classified) -> tuple[dict[str, dict[str, str | None]], dict[str, int]]:
+    operations: dict[str, dict[str, str | None]] = {}
+    summary = {
+        "trash_moved": 0,
+        "duplicates_moved": 0,
+        "renamed": 0,
+        "operation_errors": 0,
+    }
+    for item in classified:
+        if _is_cleanup_path(campaign, item.candidate.path):
+            continue
+        if item.classification != "valid":
+            folder = CLEANUP_DUPLICATES_FOLDER if item.classification == "duplicate" else CLEANUP_TRASH_FOLDER
+            action = "move_duplicate" if item.classification == "duplicate" else "move_trash"
+            operations[item.candidate.path] = {
+                "action": action,
+                "target_path": _cleanup_target_path(campaign, folder, item.candidate.path),
+                "status": "planned",
+                "error": None,
+            }
+            if action == "move_duplicate":
+                summary["duplicates_moved"] += 1
+            else:
+                summary["trash_moved"] += 1
+            continue
+        parent = PurePosixPath(item.candidate.path).parent
+        target_path = str(parent / item.normalized_name)
+        if not target_path.startswith("/"):
+            target_path = f"/{target_path}"
+        if target_path == item.candidate.path:
+            continue
+        operations[item.candidate.path] = {
+            "action": "rename_kept",
+            "target_path": target_path,
+            "status": "planned",
+            "error": None,
+        }
+        summary["renamed"] += 1
+    return operations, summary
+
+
 def _latest_check_result(session: Session, campaign_id: str) -> CheckResult | None:
-    return session.exec(
+    results = session.exec(
         select(CheckResult).where(CheckResult.campaign_id == campaign_id).order_by(CheckResult.created_at.desc())
-    ).first()
+    ).all()
+    return next((item for item in results if not (item.summary_json or {}).get("internal_message_reference")), None)
+
+
+def _message_reference_check_result(session: Session, campaign: Campaign) -> CheckResult:
+    check_result = _latest_check_result(session, campaign.id)
+    if check_result is not None:
+        return check_result
+    internal = session.exec(
+        select(CheckResult).where(CheckResult.campaign_id == campaign.id).order_by(CheckResult.created_at.desc())
+    ).all()
+    existing = next((item for item in internal if (item.summary_json or {}).get("internal_message_reference")), None)
+    if existing is not None:
+        return existing
+    check_result = CheckResult(
+        campaign_id=campaign.id,
+        summary_json={"internal_message_reference": True},
+    )
+    session.add(check_result)
+    session.commit()
+    session.refresh(check_result)
+    return check_result
 
 
 def _message_items_for_missing(session: Session, campaign: Campaign, check_result: CheckResult) -> list[dict[str, Any]]:
@@ -1816,13 +1960,12 @@ def _message_items_for_missing(session: Session, campaign: Campaign, check_resul
         return []
     campaign_orgs = _campaign_orgs(session, campaign)
     campaign_org_by_org_id = {item.organization_id: item for item in campaign_orgs}
-    template = _default_mail_template(session)
     result: list[dict[str, Any]] = []
     for org in missing:
         campaign_org = campaign_org_by_org_id.get(org.id)
         if campaign_org is None:
             continue
-        subject, body = mail_values_for_campaign_org(campaign, org, campaign_org, template.subject_template, template.body_template)
+        subject, body = missing_file_mail_values(campaign, campaign_org)
         result.append(
             {
                 "campaign_id": campaign.id,
@@ -1836,6 +1979,42 @@ def _message_items_for_missing(session: Session, campaign: Campaign, check_resul
                 "body": body,
                 "status": "pending" if org.email else "failed",
                 "last_error": None if org.email else "У организации не указан email.",
+            }
+        )
+    return result
+
+
+def _message_items_for_all_links(session: Session, campaign: Campaign, check_result: CheckResult) -> list[dict[str, Any]]:
+    organizations = _organizations_for_campaign(session, campaign)
+    campaign_org_by_org_id = {
+        item.organization_id: item
+        for item in _campaign_orgs(session, campaign)
+    }
+    result: list[dict[str, Any]] = []
+    for org in organizations:
+        campaign_org = campaign_org_by_org_id.get(org.id)
+        if campaign_org is None:
+            continue
+        subject, body = upload_link_mail_values(campaign, campaign_org)
+        error = None
+        if not campaign_org.public_link:
+            error = "Для организации не создана ссылка для загрузки."
+        elif not org.email:
+            error = "У организации не указан email."
+        result.append(
+            {
+                "campaign_id": campaign.id,
+                "check_result_id": check_result.id,
+                "organization_id": org.id,
+                "organization_code": org.code,
+                "organization_name": org.display_name,
+                "to_email": org.email or "",
+                "extra_emails": org.extra_emails or [],
+                "subject": subject,
+                "body": body,
+                "status": "pending" if not error else "failed",
+                "last_error": error,
+                "has_link": bool(campaign_org.public_link),
             }
         )
     return result
@@ -1934,6 +2113,79 @@ async def _scan_campaign(session: Session, campaign: Campaign, request: Request,
     return classify_files(candidates, organizations, allowed_extensions)
 
 
+async def _scan_organization_folders(
+    session: Session,
+    campaign: Campaign,
+    request: Request,
+    payload: ScanIn | None = None,
+) -> tuple[list[ClassifiedFile], dict[str, Any]]:
+    scan_path = payload.path if payload and payload.path else campaign.campaign_folder_path
+    root = settings_map(session, include_secret=True).get("root_path") or campaign.parent_nc_path
+    ensure_under_root(scan_path, root)
+    organizations = _organizations_for_campaign(session, campaign)
+    org_by_id = {org.id: org for org in organizations}
+    summary: dict[str, Any] = {
+        "folder_presence_only": True,
+        "scan_mode": "folder_presence",
+        "renamed": 0,
+        "duplicates_moved": 0,
+        "trash_moved": 0,
+        "operation_errors": 0,
+        "folders_with_files": 0,
+        "folders_without_files": 0,
+        "not_applicable_fields": ["renamed", "duplicates_moved", "trash_moved"],
+    }
+    classified: list[ClassifiedFile] = []
+    seen_org_ids: set[str] = set()
+    folder_errors: list[dict[str, str]] = []
+
+    async with NextcloudClient(_nc_credentials(session, request)) as client:
+        for campaign_org in _campaign_orgs(session, campaign):
+            if campaign_org.organization_id in seen_org_ids:
+                continue
+            seen_org_ids.add(campaign_org.organization_id)
+            organization = org_by_id.get(campaign_org.organization_id)
+            if organization is None:
+                continue
+            folder_path = ensure_under_root(campaign_org.folder_path, scan_path)
+            try:
+                entries = [entry for entry in await client.propfind(folder_path, depth=1) if not _is_cleanup_path(campaign, entry.path)]
+            except AppError as exc:
+                summary["operation_errors"] += 1
+                summary["folders_without_files"] += 1
+                folder_errors.append({"folder_path": folder_path, "error": exc.message})
+                continue
+            files = [
+                entry
+                for entry in entries
+                if not entry.is_collection and entry.path != folder_path and not _is_cleanup_path(campaign, entry.path)
+            ]
+            if not files:
+                summary["folders_without_files"] += 1
+                continue
+            summary["folders_with_files"] += 1
+            for entry in files:
+                classified.append(
+                    ClassifiedFile(
+                        FileCandidate(
+                            path=entry.path,
+                            name=entry.name,
+                            size=entry.size,
+                            mtime=entry.mtime,
+                            mime_type=entry.mime_type,
+                        ),
+                        entry.name,
+                        "valid",
+                        "not_applicable",
+                        organization.id,
+                    )
+                )
+
+    if folder_errors:
+        summary["folder_errors"] = folder_errors
+    return classified, summary
+
+
 def _scan_payload(
     session: Session,
     campaign: Campaign,
@@ -1941,15 +2193,13 @@ def _scan_payload(
     *,
     status: str,
     file_operations: dict[str, dict[str, str | None]] | None = None,
-    extra_summary: dict[str, int] | None = None,
+    extra_summary: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     file_operations = file_operations or {}
     organizations = _organizations_for_campaign(session, campaign)
     org_by_id = {org.id: org for org in organizations}
-    summary: dict[str, int] = {"total": len(classified)}
-    for item in classified:
-        summary[item.classification] = summary.get(item.classification, 0) + 1
-    summary.update(extra_summary or {})
+    missing = _missing_organizations_from_classified(organizations, classified)
+    summary = _check_summary(classified, missing, extra_summary)
     return {
         "campaign_id": campaign.id,
         "operation_type": "scan",
@@ -1980,24 +2230,43 @@ def _scan_payload(
 @router.post("/campaigns/{campaign_id}/scan/preview")
 async def scan_preview(campaign_id: str, session: SessionDep, request: Request, payload: ScanIn | None = None) -> dict[str, Any]:
     campaign = _get_campaign(session, campaign_id)
-    try:
-        classified = await _scan_campaign(session, campaign, request, payload)
-    except AppError as exc:
-        _raise(exc)
-    return _scan_payload(session, campaign, classified, status="preview")
+    if campaign_upload_mode(campaign) == "organization":
+        try:
+            classified, cleanup_summary = await _scan_organization_folders(session, campaign, request, payload)
+        except AppError as exc:
+            _raise(exc)
+        file_operations = {}
+    else:
+        try:
+            classified = await _scan_campaign(session, campaign, request, payload)
+        except AppError as exc:
+            _raise(exc)
+        file_operations, cleanup_summary = _planned_scan_file_operations(campaign, classified)
+    payload_data = _scan_payload(session, campaign, classified, status="preview", file_operations=file_operations, extra_summary=cleanup_summary)
+    payload_data["summary"]["path"] = payload.path if payload and payload.path else campaign.campaign_folder_path
+    return payload_data
 
 
 @router.post("/campaigns/{campaign_id}/scan/apply")
 async def scan_apply(campaign_id: str, session: SessionDep, request: Request, payload: ScanIn | None = None) -> dict[str, Any]:
     campaign = _get_campaign(session, campaign_id)
-    try:
-        classified = await _scan_campaign(session, campaign, request, payload)
-    except AppError as exc:
-        _raise(exc)
-    try:
-        current_paths, file_operations, cleanup_summary, cleanup_batch_id = await _apply_scan_file_operations(session, campaign, request, classified)
-    except AppError as exc:
-        _raise(exc)
+    if campaign_upload_mode(campaign) == "organization":
+        try:
+            classified, cleanup_summary = await _scan_organization_folders(session, campaign, request, payload)
+        except AppError as exc:
+            _raise(exc)
+        current_paths: dict[str, str] = {}
+        file_operations: dict[str, dict[str, str | None]] = {}
+        cleanup_batch_id = None
+    else:
+        try:
+            classified = await _scan_campaign(session, campaign, request, payload)
+        except AppError as exc:
+            _raise(exc)
+        try:
+            current_paths, file_operations, cleanup_summary, cleanup_batch_id = await _apply_scan_file_operations(session, campaign, request, classified)
+        except AppError as exc:
+            _raise(exc)
     campaign_orgs = _campaign_orgs(session, campaign)
     persist_scan_results(session, campaign, classified, campaign_orgs, current_paths)
     missing = missing_organizations(session, campaign)
@@ -2042,7 +2311,7 @@ def campaign_report(campaign_id: str, session: SessionDep) -> Response:
     return Response(
         report_workbook(campaign, files, missing),
         media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        headers={"Content-Disposition": f'attachment; filename="campaign-{campaign_id}-report.xlsx"'},
+        headers={"Content-Disposition": _download_disposition("report", campaign, "xlsx")},
     )
 
 
@@ -2053,7 +2322,7 @@ def campaign_message(campaign_id: str, session: SessionDep) -> Response:
     return Response(
         text.encode("utf-8"),
         media_type="text/plain; charset=utf-8",
-        headers={"Content-Disposition": f'attachment; filename="campaign-{campaign_id}-missing.txt"'},
+        headers={"Content-Disposition": _download_disposition("message", campaign, "txt")},
     )
 
 
@@ -2065,13 +2334,11 @@ def campaign_operation_state(campaign_id: str, session: SessionDep) -> dict[str,
     organizations = _organizations_for_campaign(session, campaign)
     files = session.exec(select(FileRecord).where(FileRecord.campaign_id == campaign.id)).all()
     check_result = _latest_check_result(session, campaign.id)
-    message_batch = None
-    if check_result:
-        message_batch = session.exec(
-            select(MessageBatch)
-            .where(MessageBatch.check_result_id == check_result.id)
-            .order_by(MessageBatch.created_at.desc())
-        ).first()
+    message_batch = session.exec(
+        select(MessageBatch)
+        .where(MessageBatch.campaign_id == campaign.id)
+        .order_by(MessageBatch.created_at.desc())
+    ).first()
     folder_done = len([item for item in campaign_orgs if item.status in {CampaignOrganizationStatus.folder_created, CampaignOrganizationStatus.link_created, CampaignOrganizationStatus.uploaded, CampaignOrganizationStatus.missing, CampaignOrganizationStatus.rejected}])
     links_done = len([item for item in campaign_orgs if item.public_link])
     counts: dict[str, int] = {"total": len(files), "missing": len(missing_organizations(session, campaign))}
@@ -2103,6 +2370,7 @@ def campaign_operation_history(campaign_id: str, session: SessionDep) -> dict[st
         .where(CheckResult.campaign_id == campaign.id)
         .order_by(CheckResult.created_at.desc())
     ).all()
+    checks = [item for item in checks if not (item.summary_json or {}).get("internal_message_reference")]
     message_batches = session.exec(
         select(MessageBatch)
         .where(MessageBatch.campaign_id == campaign.id)
@@ -2149,6 +2417,7 @@ def messages_preview(campaign_id: str, session: SessionDep) -> dict[str, Any]:
         "check_result_id": check_result.id,
         "check_result_created_at": check_result.created_at.isoformat(),
         "summary": {
+            "mailing_kind": "missing",
             "planned": len(items),
             "missing": len(items),
             "without_email": len([item for item in items if not item.get("to_email")]),
@@ -2159,21 +2428,65 @@ def messages_preview(campaign_id: str, session: SessionDep) -> dict[str, Any]:
     }
 
 
-def _create_message_batch(session: Session, campaign: Campaign, check_result: CheckResult, user_id: str | None) -> MessageBatch:
-    planned = _message_items_for_missing(session, campaign, check_result)
+@router.post("/campaigns/{campaign_id}/messages/all-links/preview")
+def all_links_messages_preview(campaign_id: str, session: SessionDep) -> dict[str, Any]:
+    campaign = _get_campaign(session, campaign_id)
+    check_result = _message_reference_check_result(session, campaign)
+    items = _message_items_for_all_links(session, campaign, check_result)
+    if not items or not any(item.get("has_link") for item in items):
+        raise HTTPException(
+            status_code=400,
+            detail={"code": "PUBLIC_LINKS_REQUIRED", "message": "Сначала создайте ссылки для загрузки."},
+        )
+    preview_item = next((item for item in items if item.get("body")), None)
+    return {
+        "operation_type": "messages",
+        "status": "preview",
+        "campaign_id": campaign.id,
+        "check_result_id": check_result.id,
+        "summary": {
+            "mailing_kind": "all_links",
+            "planned": len(items),
+            "pending": len([item for item in items if item.get("status") == "pending"]),
+            "failed": len([item for item in items if item.get("status") != "pending"]),
+            "without_email": len([item for item in items if not item.get("to_email")]),
+            "without_link": len([item for item in items if not item.get("has_link")]),
+            "preview_text": (preview_item or {}).get("body") or "",
+        },
+        "items": items,
+    }
+
+
+def _create_message_batch(
+    session: Session,
+    campaign: Campaign,
+    check_result: CheckResult,
+    user_id: str | None,
+    *,
+    mailing_kind: str = "missing",
+) -> MessageBatch:
+    planned = (
+        _message_items_for_all_links(session, campaign, check_result)
+        if mailing_kind == "all_links"
+        else _message_items_for_missing(session, campaign, check_result)
+    )
     without_email = len([item for item in planned if not item.get("to_email")])
+    without_link = len([item for item in planned if not item.get("has_link", True)])
     preview_item = next((item for item in planned if item.get("body")), None)
+    pending = len([item for item in planned if item.get("status") == "pending"])
     batch = MessageBatch(
         campaign_id=campaign.id,
         check_result_id=check_result.id,
         status=BatchStatus.preview,
         created_by=user_id,
         summary_json={
+            "mailing_kind": mailing_kind,
             "planned": len(planned),
-            "missing": len(planned),
-            "pending": len([item for item in planned if item.get("to_email")]),
-            "failed": without_email,
+            "missing": len(planned) if mailing_kind == "missing" else 0,
+            "pending": pending,
+            "failed": len(planned) - pending,
             "without_email": without_email,
+            "without_link": without_link,
             "check_result_created_at": check_result.created_at.isoformat(),
             "preview_text": (preview_item or {}).get("body") or "",
         },
@@ -2192,11 +2505,18 @@ def _create_message_batch(session: Session, campaign: Campaign, check_result: Ch
                 extra_emails=item.get("extra_emails") or [],
                 subject=item.get("subject") or "",
                 body=item.get("body") or "",
-                status=MailItemStatus.pending if item.get("to_email") else MailItemStatus.failed,
+                status=MailItemStatus.pending if item.get("status") == "pending" else MailItemStatus.failed,
                 last_error=item.get("last_error"),
             )
         )
-    audit(session, user_id=user_id, action="messages_prepare", entity_type="message_batch", entity_id=batch.id, after={"check_result_id": check_result.id, "count": len(planned)})
+    audit(
+        session,
+        user_id=user_id,
+        action="messages_prepare",
+        entity_type="message_batch",
+        entity_id=batch.id,
+        after={"check_result_id": check_result.id, "count": len(planned), "mailing_kind": mailing_kind},
+    )
     session.commit()
     session.refresh(batch)
     return batch
@@ -2242,6 +2562,31 @@ async def messages_prepare_send(campaign_id: str, background_tasks: BackgroundTa
     if check_result is None:
         raise HTTPException(status_code=400, detail={"code": "CHECK_RESULT_REQUIRED", "message": "Сначала выполните и сохраните проверку файлов."})
     batch = _create_message_batch(session, campaign, check_result, _user(request))
+    return _start_or_finish_message_batch(batch, background_tasks, session, request)
+
+
+@router.post("/campaigns/{campaign_id}/messages/all-links/prepare-send")
+async def all_links_messages_prepare_send(
+    campaign_id: str,
+    background_tasks: BackgroundTasks,
+    session: SessionDep,
+    request: Request,
+) -> dict[str, Any]:
+    campaign = _get_campaign(session, campaign_id)
+    check_result = _message_reference_check_result(session, campaign)
+    planned = _message_items_for_all_links(session, campaign, check_result)
+    if not planned or not any(item.get("has_link") for item in planned):
+        raise HTTPException(
+            status_code=400,
+            detail={"code": "PUBLIC_LINKS_REQUIRED", "message": "Сначала создайте ссылки для загрузки."},
+        )
+    batch = _create_message_batch(
+        session,
+        campaign,
+        check_result,
+        _user(request),
+        mailing_kind="all_links",
+    )
     return _start_or_finish_message_batch(batch, background_tasks, session, request)
 
 
@@ -2569,12 +2914,14 @@ async def put_settings(payload: SettingsIn, session: SessionDep, request: Reques
 
 
 @router.post("/settings/test-webdav")
-async def test_webdav(session: SessionDep, request: Request) -> dict[str, Any]:
+async def test_webdav(session: SessionDep, request: Request, payload: SettingsIn | None = None) -> dict[str, Any]:
     try:
-        async with NextcloudClient(_nc_credentials(session, request)) as client:
-            settings = settings_map(session, include_secret=True)
-            root_path = settings.get("root_path") or client.credentials.root_path
-            group_id = _collaboration_group(settings)
+        settings = settings_map(session, include_secret=True)
+        values = payload.model_dump(exclude_unset=True) if payload else {}
+        root_path = values.get("root_path") or settings.get("root_path") or "/"
+        root_path = ensure_under_root(root_path, root_path)
+        group_id = str(values.get("collaboration_group") if "collaboration_group" in values else settings.get("collaboration_group") or "").strip()
+        async with NextcloudClient(configured_credentials(_credentials_with_values(session, request, {**values, "root_path": root_path}))) as client:
             return await _root_access_status(client, root_path, group_id, ensure_share=False)
     except AppError as exc:
         _raise(exc)

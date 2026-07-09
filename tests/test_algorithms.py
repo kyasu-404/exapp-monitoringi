@@ -37,7 +37,7 @@ ORGS = [
         "prefix": None,
         "code": "ИМЦ",
         "display_name": "ИМЦ",
-        "aliases": ["Информационно-методический центр"],
+        "aliases": ["ИМЦ", "Информационно-методический центр"],
         "active": True,
     },
 ]
@@ -78,16 +78,24 @@ def test_generic_type_alias_matches_with_code_without_ambiguity_and_normalizes_n
     assert match.normalized_name == "ГБОУ 1.xlsx"
 
 
-def test_udod_normalization_preserves_matching_alias():
+def test_udod_without_explicit_alias_is_not_matched():
     orgs = [
         {"id": "udod-444", "type": "udod", "prefix": None, "code": "444", "display_name": "444", "aliases": [], "active": True},
     ]
 
     match = extract_organization("ИМЦ444.pdf", orgs)
 
-    assert match.status == "matched"
-    assert match.organization_id == "udod-444"
-    assert match.normalized_name == "ИМЦ 444.pdf"
+    assert match.status == "unknown"
+    assert match.organization_id is None
+
+
+def test_udod_matches_only_explicit_alias_with_boundary():
+    orgs = [
+        {"id": "udod-imc", "type": "udod", "prefix": None, "code": "ИМЦ", "display_name": "ИМЦ", "aliases": ["ИМЦ"], "active": True},
+    ]
+
+    assert extract_organization("ИМЦ отчёт.pdf", orgs).organization_id == "udod-imc"
+    assert extract_organization("ИМЦИ отчёт.pdf", orgs).status == "unknown"
 
 
 def test_org_code_sort_keeps_special_names_after_numbers():

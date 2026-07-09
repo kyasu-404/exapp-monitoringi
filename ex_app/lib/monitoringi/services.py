@@ -81,6 +81,8 @@ def organization_type_aliases(value: Any) -> list[str]:
 
 def aliases_or_type_defaults(org_type: Any, aliases: list[Any] | None) -> list[str]:
     cleaned = [str(item).strip() for item in aliases or [] if str(item).strip()]
+    if normalize_organization_type(org_type) == "udod":
+        return cleaned
     return cleaned or organization_type_aliases(org_type)
 
 
@@ -326,14 +328,22 @@ def _parse_csv(content: bytes) -> list[dict[str, Any]]:
 
 
 def _normalize_import_row(raw: dict[str, Any]) -> dict[str, Any] | None:
+    org_type = normalize_organization_type(raw.get("type"))
     code = str(raw.get("code") or "").strip()
     display_name = str(raw.get("display_name") or "").strip()
-    if not code and not display_name:
-        return None
-    code = code or display_name
-    display_name = display_name or code
-    org_type = normalize_organization_type(raw.get("type"))
     aliases = _split_list(raw.get("aliases"))
+    if org_type == "udod":
+        identifier = (aliases[0] if aliases else display_name or code).strip()
+        if not identifier:
+            return None
+        aliases = aliases or [identifier]
+        code = identifier
+        display_name = identifier
+    elif not code and not display_name:
+        return None
+    else:
+        code = code or display_name
+        display_name = display_name or code
     return {
         "type": org_type,
         "prefix": str(raw.get("prefix") or "").strip() or None,
@@ -358,6 +368,8 @@ def validate_organization_rows(session: Session, rows: list[dict[str, Any]]) -> 
         type_code = (str(row.get("type")), str(row.get("code")))
         if not row.get("code"):
             errors.append("EMPTY_CODE")
+        if str(row.get("type")) == "udod" and not row.get("aliases"):
+            errors.append("EMPTY_ALIASES")
         if type_code in seen_type_code:
             errors.append("DUPLICATE_ORGANIZATION_IN_FILE")
         if type_code in existing_type_code:
@@ -826,6 +838,31 @@ def mail_values_for_campaign_org(
 ) -> tuple[str, str]:
     values = default_template_values(campaign, organization, campaign_org)
     return render_template(subject_template, values), render_template(body_template, values)
+
+
+def upload_link_mail_values(campaign: Campaign, campaign_org: CampaignOrganization) -> tuple[str, str]:
+    campaign_date = campaign.date.strftime("%d.%m.%Y")
+    deadline = parse_deadline(campaign.deadline)
+    deadline_clause = f" до {deadline.strftime('%d.%m.%Y')}" if deadline else ""
+    subject = f'Запрос "{campaign.title}"'
+    body = (
+        "Уважаемые коллеги!\n\n"
+        f'Просим загрузить документы по запросу "{campaign.title}" от {campaign_date}{deadline_clause}.\n\n'
+        f"Ссылка для загрузки: {campaign_org.public_link or ''}"
+    )
+    return subject, body
+
+
+def missing_file_mail_values(campaign: Campaign, campaign_org: CampaignOrganization) -> tuple[str, str]:
+    campaign_date = campaign.date.strftime("%d.%m.%Y")
+    subject = f'Запрос "{campaign.title}"'
+    body = (
+        "Уважаемые коллеги!\n\n"
+        f'От вас не предоставлены файл(ы) по запросу "{campaign.title}" от {campaign_date}. '
+        "Если вы уверены, что файл загружали по ссылке, проверьте корректность имени файла и формат документа.\n\n"
+        f"Ссылка для загрузки: {campaign_org.public_link or ''}"
+    )
+    return subject, body
 
 
 def target_invalid_path(root_folder: str, source_path: str, invalid_folder: str, reason: str) -> str:

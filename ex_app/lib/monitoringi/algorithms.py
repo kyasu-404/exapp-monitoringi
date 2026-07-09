@@ -159,9 +159,12 @@ def _dedupe_values(values: Iterable[Any]) -> list[str]:
 
 
 def effective_organization_aliases(org: OrganizationLike | dict[str, Any]) -> list[str]:
+    org_type = _organization_type_key(_get_org_value(org, "type"))
+    if org_type == "udod":
+        return _dedupe_values(_get_org_value(org, "aliases", []) or [])
     return _dedupe_values(
         [
-            *default_organization_aliases(_get_org_value(org, "type")),
+            *default_organization_aliases(org_type),
             _get_org_value(org, "prefix"),
             *(_get_org_value(org, "aliases", []) or []),
         ]
@@ -219,6 +222,15 @@ def _boundary_prefix_match(base: str, token: str) -> bool:
     return bool(pattern.search(base))
 
 
+def _udod_alias_prefix_match(filename: str, alias: str) -> bool:
+    stem, _suffix = split_name(filename.strip())
+    base = _MULTI_SPACES.sub(" ", stem.replace("ё", "е").replace("Ё", "Е").replace("№", "")).strip().casefold()
+    alias_norm = _MULTI_SPACES.sub(" ", alias.replace("ё", "е").replace("Ё", "Е").replace("№", "")).strip().casefold()
+    if not alias_norm:
+        return False
+    return bool(re.search(rf"^{re.escape(alias_norm)}(?=$|[\s_.-])", base, re.IGNORECASE))
+
+
 def extract_organization(
     filename: str,
     organizations: Iterable[OrganizationLike | dict[str, Any]],
@@ -237,6 +249,12 @@ def extract_organization(
         code = str(_get_org_value(org, "code", ""))
         display_name = str(_get_org_value(org, "display_name", ""))
         aliases = effective_organization_aliases(org)
+        if _organization_type_key(_get_org_value(org, "type")) == "udod":
+            matched_alias = next((alias for alias in aliases if _udod_alias_prefix_match(filename, alias)), None)
+            if matched_alias:
+                matches.add(org_id)
+                matched_aliases[org_id] = matched_alias
+            continue
 
         matched_alias = next((alias for alias in aliases if _alias_code_prefix_match(base, alias, code)), None)
         if matched_alias:

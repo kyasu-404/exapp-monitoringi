@@ -5,6 +5,7 @@ from __future__ import annotations
 import xml.etree.ElementTree as ET
 import json
 from base64 import b64encode
+from contextlib import suppress
 from dataclasses import dataclass
 from datetime import date, datetime, timezone
 from email.utils import parsedate_to_datetime
@@ -340,11 +341,25 @@ class NextcloudClient:
             code = "PUBLIC_UPLOAD_DISABLED" if int(meta.get("statuscode")) == 403 else "SHARE_API_FAILED"
             raise NextcloudApiError(code, str(meta.get("message") or "Ошибка OCS Share API."), 502)
         data = payload.get("data", {})
-        return {
+        share = {
             "share_id": str(data.get("id")) if data.get("id") is not None else None,
             "public_link": data.get("url"),
             "token": data.get("token"),
         }
+        share_id = str(share.get("share_id") or "")
+        if share_id:
+            try:
+                await self.update_share_permissions(
+                    share_id,
+                    permissions,
+                    public_upload=public_upload,
+                    file_request=file_request,
+                )
+            except Exception:
+                with suppress(Exception):
+                    await self.delete_public_share(share_id)
+                raise
+        return share
 
     async def shares_for_path(self, path: str) -> list[dict]:
         safe_path = self._safe_path(path)
@@ -405,20 +420,7 @@ class NextcloudClient:
             raise NextcloudApiError("CURRENT_USER_EMAIL_MISSING", "У текущего пользователя Nextcloud не указан email.", 400)
         return email
 
-    async def update_share_permissions(
-        self,
-        share_id: str,
-        permissions: int,
-        *,
-        public_upload: bool | None = None,
-        file_request: bool | None = None,
-    ) -> None:
-        data: dict[str, str | int] = {"permissions": permissions}
-        if public_upload is not None:
-            data["publicUpload"] = "true" if public_upload else "false"
-        attributes = _share_attributes(file_request_enabled=file_request)
-        if attributes:
-            data["attributes"] = attributes
+    async def _put_share_update(self, share_id: str, data: dict[str, str | int]) -> None:
         response = await self._client.put(
             f"/ocs/v2.php/apps/files_sharing/api/v1/shares/{quote(str(share_id), safe='')}",
             params={"format": "json"},
@@ -433,6 +435,24 @@ class NextcloudClient:
         meta = payload.get("meta", {})
         if int(meta.get("statuscode", 100)) >= 400:
             raise NextcloudApiError("SHARE_UPDATE_FAILED", str(meta.get("message") or "Не удалось обновить общий доступ."), 502)
+
+    async def update_share_permissions(
+        self,
+        share_id: str,
+        permissions: int,
+        *,
+        public_upload: bool | None = None,
+        file_request: bool | None = None,
+    ) -> None:
+        updates: list[dict[str, str | int]] = []
+        if public_upload is not None:
+            updates.append({"publicUpload": "true" if public_upload else "false"})
+        updates.append({"permissions": permissions})
+        attributes = _share_attributes(file_request_enabled=file_request)
+        if attributes:
+            updates.append({"attributes": attributes})
+        for update in updates:
+            await self._put_share_update(share_id, update)
 
     async def ensure_group_share(
         self,

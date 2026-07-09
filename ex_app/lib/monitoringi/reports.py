@@ -46,6 +46,13 @@ LINK_COLUMNS = [
     "Ссылка для загрузки",
 ]
 
+LINK_SUMMARY_COLUMNS = [
+    "Название мониторинга",
+    "Тип ОУ",
+    "Папка Nextcloud",
+    "Ссылка",
+]
+
 FORMULA_PREFIXES = ("=", "+", "-", "@", "\t", "\r")
 
 
@@ -75,6 +82,27 @@ def _organization_type_value(organization: Organization) -> str:
 
 def _organization_type_label(value: str) -> str:
     return ORGANIZATION_TYPE_LABELS.get(value, value)
+
+
+def _campaign_upload_mode(campaign: Campaign) -> str:
+    return campaign.upload_mode.value if hasattr(campaign.upload_mode, "value") else str(getattr(campaign, "upload_mode", "") or "organization")
+
+
+def _campaign_type_labels(campaign: Campaign, organizations: list[Organization]) -> list[str]:
+    values = list(getattr(campaign, "selected_org_types", []) or [])
+    if not values:
+        values = sorted({_organization_type_value(org) for org in organizations}, key=lambda item: ORGANIZATION_TYPE_ORDER.index(item) if item in ORGANIZATION_TYPE_ORDER else len(ORGANIZATION_TYPE_ORDER))
+    labels = []
+    for value in values:
+        raw = value.value if hasattr(value, "value") else str(value)
+        label = _organization_type_label(raw)
+        if label not in labels:
+            labels.append(label)
+    return labels
+
+
+def link_columns(campaign: Campaign) -> list[str]:
+    return LINK_SUMMARY_COLUMNS if _campaign_upload_mode(campaign) in {"campaign_root", "org_type"} else LINK_COLUMNS
 
 
 def _parse_deadline(value: date | datetime | str | None) -> datetime | None:
@@ -145,6 +173,35 @@ def link_rows(
     campaign_orgs: list[CampaignOrganization],
 ) -> list[dict[str, str]]:
     org_by_id = {org.id: org for org in organizations}
+    mode = _campaign_upload_mode(campaign)
+    if mode == "campaign_root":
+        public_link = next((item.public_link for item in campaign_orgs if item.public_link), "")
+        return [
+            {
+                "Название мониторинга": campaign.title,
+                "Тип ОУ": ", ".join(_campaign_type_labels(campaign, organizations)) or "Все",
+                "Папка Nextcloud": campaign.campaign_folder_path,
+                "Ссылка": public_link or "",
+            }
+        ]
+    if mode == "org_type":
+        rows_by_type: dict[str, dict[str, str]] = {}
+        for item in sorted(campaign_orgs, key=lambda row: _campaign_org_sort_key(row, org_by_id)):
+            org = org_by_id.get(item.organization_id)
+            if org is None:
+                continue
+            org_type = _organization_type_value(org)
+            org_type_label = _organization_type_label(org_type)
+            rows_by_type.setdefault(
+                org_type,
+                {
+                    "Название мониторинга": campaign.title,
+                    "Тип ОУ": org_type_label,
+                    "Папка Nextcloud": item.folder_path,
+                    "Ссылка": item.public_link or "",
+                },
+            )
+        return list(rows_by_type.values())
     rows: list[dict[str, str]] = []
     for item in sorted(campaign_orgs, key=lambda row: _campaign_org_sort_key(row, org_by_id)):
         org = org_by_id.get(item.organization_id)

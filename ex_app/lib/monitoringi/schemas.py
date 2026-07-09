@@ -15,7 +15,7 @@ from .models import CampaignOrgLayout, CampaignUploadMode, OrganizationType
 class OrganizationIn(BaseModel):
     type: OrganizationType = OrganizationType.school
     prefix: str | None = None
-    code: str
+    code: str | None = None
     display_name: str | None = None
     short_name: str | None = None
     email: EmailStr | None = None
@@ -27,11 +27,11 @@ class OrganizationIn(BaseModel):
 
     @field_validator("code")
     @classmethod
-    def normalize_code(cls, value: str) -> str:
+    def normalize_code(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
         value = str(value or "").strip()
-        if not value:
-            raise ValueError("Номер ОУ не должен быть пустым.")
-        return value
+        return value or None
 
     @field_validator("display_name", "short_name", "prefix", "notes", mode="before")
     @classmethod

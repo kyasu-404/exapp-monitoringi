@@ -1,11 +1,15 @@
 from datetime import date
+from types import SimpleNamespace
 
+import monitoringi.api as api_module
 import pytest
 from sqlmodel import Session, SQLModel, create_engine, select
 
-from monitoringi.models import Campaign, CampaignOrganization, CampaignOrganizationStatus, OperationItem, OperationItemStatus, Organization
-from monitoringi.reports import csv_bytes, link_rows, mailing_rows, render_template, spreadsheet_safe_value
-from monitoringi.services import apply_batch, campaign_share_targets, create_batch, parse_organization_table, planned_folder_items
+from monitoringi.algorithms import ClassifiedFile, FileCandidate
+from monitoringi.api import _scan_organization_folders, _scan_payload, deactivate_all_organizations
+from monitoringi.models import Campaign, CampaignOrganization, CampaignOrganizationStatus, FileRecord, OperationItem, OperationItemStatus, Organization
+from monitoringi.reports import csv_bytes, link_columns, link_rows, mailing_rows, render_template, spreadsheet_safe_value
+from monitoringi.services import apply_batch, campaign_share_targets, create_batch, parse_organization_table, persist_scan_results, planned_folder_items
 
 
 def make_session():
@@ -61,6 +65,137 @@ def test_import_organizations_csv_falls_back_without_sniffer_header():
 
     assert rows[0]["type"] == "school"
     assert rows[0]["code"] == "1"
+
+
+def test_deactivate_all_organizations_keeps_records_but_hides_them():
+    session = make_session()
+    session.add(Organization(id="org-1", type="school", code="1", display_name="School 1"))
+    session.add(Organization(id="org-2", type="kindergarten", code="2", display_name="Garden 2"))
+    session.commit()
+
+    result = deactivate_all_organizations(session, SimpleNamespace(scope={"username": "tester"}))
+
+    organizations = session.exec(select(Organization)).all()
+    assert result == {"status": "deactivated", "count": 2}
+    assert [item.active for item in organizations] == [False, False]
+
+
+def test_scan_preview_payload_includes_missing_organizations_without_persisting():
+    session = make_session()
+    campaign = Campaign(
+        id="campaign-1",
+        title="Check",
+        date=date(2026, 7, 8),
+        deadline=None,
+        parent_nc_path="/Monitoringi",
+        campaign_folder_path="/Monitoringi/Check",
+        selected_org_types=["school"],
+        allowed_extensions=["pdf"],
+    )
+    submitted = Organization(id="org-1", type="school", code="1", display_name="School 1")
+    missing = Organization(id="org-2", type="school", code="2", display_name="School 2")
+    session.add(campaign)
+    session.add(submitted)
+    session.add(missing)
+    session.add(CampaignOrganization(campaign_id=campaign.id, organization_id=submitted.id, folder_path="/Monitoringi/Check/1"))
+    session.add(CampaignOrganization(campaign_id=campaign.id, organization_id=missing.id, folder_path="/Monitoringi/Check/2"))
+    session.commit()
+
+    payload = _scan_payload(
+        session,
+        campaign,
+        [
+            ClassifiedFile(
+                FileCandidate("/Monitoringi/Check/1/School 1.pdf", "School 1.pdf", size=10),
+                "School 1.pdf",
+                "valid",
+                None,
+                submitted.id,
+            )
+        ],
+        status="preview",
+    )
+
+    assert payload["summary"]["missing"] == 1
+    assert payload["summary"]["missing_organization_codes"] == ["2"]
+    assert payload["summary"]["missing_organization_names"] == ["School 2"]
+
+
+@pytest.mark.asyncio
+async def test_organization_folder_scan_only_checks_folder_presence(monkeypatch):
+    session = make_session()
+    campaign = Campaign(
+        id="campaign-organization-folders",
+        title="Folder Presence",
+        date=date(2026, 7, 8),
+        deadline=None,
+        parent_nc_path="/Мониторинги",
+        campaign_folder_path="/Мониторинги/Folder Presence",
+        selected_org_types=["school"],
+        allowed_extensions=["pdf"],
+        upload_mode="organization",
+    )
+    submitted = Organization(id="org-1", type="school", code="1", display_name="School 1")
+    missing = Organization(id="org-2", type="school", code="2", display_name="School 2")
+    session.add(campaign)
+    session.add(submitted)
+    session.add(missing)
+    session.add(CampaignOrganization(campaign_id=campaign.id, organization_id=submitted.id, folder_path="/Мониторинги/Folder Presence/1"))
+    session.add(CampaignOrganization(campaign_id=campaign.id, organization_id=missing.id, folder_path="/Мониторинги/Folder Presence/2"))
+    session.commit()
+
+    def entry(path, *, is_collection=False, size=None):
+        return SimpleNamespace(
+            path=path,
+            name=path.rsplit("/", 1)[-1],
+            is_collection=is_collection,
+            size=size,
+            mtime=None,
+            mime_type=None,
+        )
+
+    class FakeClient:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return None
+
+        async def propfind(self, path, depth=1):
+            assert depth == 1
+            if path.endswith("/1"):
+                return [entry(path, is_collection=True), entry(f"{path}/произвольное имя.tmp", size=12)]
+            return [entry(path, is_collection=True)]
+
+    monkeypatch.setattr(api_module, "_nc_credentials", lambda *_args, **_kwargs: {})
+    monkeypatch.setattr(api_module, "NextcloudClient", FakeClient)
+
+    classified, summary = await _scan_organization_folders(session, campaign, SimpleNamespace(scope={}))
+
+    assert summary["folder_presence_only"] is True
+    assert summary["renamed"] == 0
+    assert summary["duplicates_moved"] == 0
+    assert summary["trash_moved"] == 0
+    assert summary["folders_with_files"] == 1
+    assert summary["folders_without_files"] == 1
+    assert [(item.classification, item.reason, item.organization_id, item.normalized_name) for item in classified] == [
+        ("valid", "not_applicable", submitted.id, "произвольное имя.tmp")
+    ]
+
+    persist_scan_results(
+        session,
+        campaign,
+        classified,
+        session.exec(select(CampaignOrganization).where(CampaignOrganization.campaign_id == campaign.id)).all(),
+    )
+
+    campaign_orgs = session.exec(select(CampaignOrganization).where(CampaignOrganization.campaign_id == campaign.id)).all()
+    status_by_org = {item.organization_id: item.status for item in campaign_orgs}
+    assert status_by_org == {submitted.id: CampaignOrganizationStatus.uploaded, missing.id: CampaignOrganizationStatus.missing}
+    assert session.exec(select(FileRecord)).one().reason == "not_applicable"
 
 
 def test_spreadsheet_exports_escape_formula_like_values():
@@ -233,6 +368,68 @@ def test_org_type_upload_mode_creates_type_folders_and_type_share_targets_only()
     assert all(item["reason"] == "organization_type_folder" for item in items)
     assert [target["target_path"] for target in targets] == ["/Мониторинги/types/Школы", "/Мониторинги/types/Сады"]
     assert [target["campaign_org_ids"] for target in targets] == [["campaign-org-school"], ["campaign-org-kindergarten"]]
+
+
+def test_campaign_root_link_export_uses_single_summary_row():
+    campaign = Campaign(
+        id="campaign-root",
+        title="Root",
+        date=date(2026, 7, 2),
+        parent_nc_path="/Мониторинги",
+        campaign_folder_path="/Мониторинги/Root",
+        selected_org_types=["school", "kindergarten"],
+        upload_mode="campaign_root",
+    )
+    organizations = [
+        Organization(id="org-school", type="school", code="1", display_name="1"),
+        Organization(id="org-kindergarten", type="kindergarten", code="2", display_name="2"),
+    ]
+    campaign_orgs = [
+        CampaignOrganization(id="co-1", campaign_id=campaign.id, organization_id="org-school", folder_path="/Мониторинги/Root", public_link="https://nc/s/root"),
+        CampaignOrganization(id="co-2", campaign_id=campaign.id, organization_id="org-kindergarten", folder_path="/Мониторинги/Root", public_link="https://nc/s/root"),
+    ]
+
+    rows = link_rows(campaign, organizations, campaign_orgs)
+
+    assert link_columns(campaign) == ["Название мониторинга", "Тип ОУ", "Папка Nextcloud", "Ссылка"]
+    assert rows == [
+        {
+            "Название мониторинга": "Root",
+            "Тип ОУ": "Школы, Сады",
+            "Папка Nextcloud": "/Мониторинги/Root",
+            "Ссылка": "https://nc/s/root",
+        }
+    ]
+
+
+def test_org_type_link_export_deduplicates_links_by_type():
+    campaign = Campaign(
+        id="campaign-types",
+        title="Types",
+        date=date(2026, 7, 2),
+        parent_nc_path="/Мониторинги",
+        campaign_folder_path="/Мониторинги/Types",
+        selected_org_types=["school", "kindergarten"],
+        upload_mode="org_type",
+    )
+    organizations = [
+        Organization(id="org-school-1", type="school", code="1", display_name="1"),
+        Organization(id="org-school-2", type="school", code="2", display_name="2"),
+        Organization(id="org-kindergarten", type="kindergarten", code="222", display_name="222"),
+    ]
+    campaign_orgs = [
+        CampaignOrganization(id="co-1", campaign_id=campaign.id, organization_id="org-school-1", folder_path="/Мониторинги/Types/Школы", public_link="https://nc/s/school"),
+        CampaignOrganization(id="co-2", campaign_id=campaign.id, organization_id="org-school-2", folder_path="/Мониторинги/Types/Школы", public_link="https://nc/s/school"),
+        CampaignOrganization(id="co-3", campaign_id=campaign.id, organization_id="org-kindergarten", folder_path="/Мониторинги/Types/Сады", public_link="https://nc/s/kindergarten"),
+    ]
+
+    rows = link_rows(campaign, organizations, campaign_orgs)
+
+    assert link_columns(campaign) == ["Название мониторинга", "Тип ОУ", "Папка Nextcloud", "Ссылка"]
+    assert rows == [
+        {"Название мониторинга": "Types", "Тип ОУ": "Школы", "Папка Nextcloud": "/Мониторинги/Types/Школы", "Ссылка": "https://nc/s/school"},
+        {"Название мониторинга": "Types", "Тип ОУ": "Сады", "Папка Nextcloud": "/Мониторинги/Types/Сады", "Ссылка": "https://nc/s/kindergarten"},
+    ]
 
 
 def test_organization_upload_mode_can_keep_all_org_folders_in_campaign_root():

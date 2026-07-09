@@ -175,20 +175,7 @@
 
 .mrm-row-actions {
   justify-content: flex-end;
-}
-
-.mrm-row-actions-compact {
-  display: grid;
-  grid-template-columns: repeat(2, minmax(0, auto));
-  justify-content: end;
-  min-width: 204px;
-  gap: 6px;
-}
-
-.mrm-row-actions-compact .mrm-button {
-  min-width: 96px;
-  padding-left: 12px;
-  padding-right: 12px;
+  overflow: visible;
 }
 
 .mrm-segmented {
@@ -417,6 +404,8 @@
 
 .mrm-campaign-table {
   table-layout: fixed;
+  border-collapse: separate;
+  border-spacing: 0;
 }
 
 .mrm-campaign-table th,
@@ -428,22 +417,35 @@
 
 .mrm-campaign-table th:nth-child(1),
 .mrm-campaign-table td:nth-child(1) {
-  width: 31%;
+  width: 30%;
 }
 
 .mrm-campaign-table th:nth-child(2),
 .mrm-campaign-table td:nth-child(2) {
-  width: 17%;
+  width: 18%;
 }
 
 .mrm-campaign-table th:nth-child(3),
 .mrm-campaign-table td:nth-child(3) {
-  width: 31%;
+  width: auto;
 }
 
 .mrm-campaign-table th:nth-child(4),
 .mrm-campaign-table td:nth-child(4) {
-  width: 21%;
+  width: 64px;
+  min-width: 64px;
+  padding-left: 10px;
+  padding-right: 10px;
+  border-left: 1px solid var(--mrm-border);
+}
+
+.mrm-campaign-table td:nth-child(4) {
+  vertical-align: middle;
+  text-align: center;
+}
+
+.mrm-campaign-table tbody tr:last-child td {
+  border-bottom: 0;
 }
 
 .mrm-campaign-title-cell {
@@ -472,6 +474,8 @@
   display: flex;
   gap: 5px;
   flex-wrap: wrap;
+  min-width: 0;
+  max-width: 100%;
 }
 
 .mrm-chip {
@@ -488,6 +492,7 @@
   line-height: 1.2;
   overflow: hidden;
   text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .mrm-form {
@@ -633,6 +638,10 @@
   height: 16px;
   min-width: 16px;
   accent-color: var(--mrm-primary);
+}
+
+.mrm-field.is-disabled {
+  opacity: .62;
 }
 
 .mrm-multiselect {
@@ -808,6 +817,101 @@
   font-size: 13px;
 }
 
+.mrm-icon-button {
+  width: 38px;
+  min-width: 38px;
+  height: 34px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border: 1px solid var(--mrm-border);
+  border-radius: 8px;
+  background: var(--mrm-hover);
+  color: var(--mrm-text);
+  font: inherit;
+  font-size: 18px;
+  font-weight: 900;
+  line-height: 1;
+  cursor: pointer;
+}
+
+.mrm-icon-button:hover,
+.mrm-action-menu.is-open .mrm-icon-button {
+  border-color: var(--mrm-primary);
+  color: var(--mrm-primary);
+}
+
+.mrm-action-menu {
+  display: inline-flex;
+  justify-content: center;
+  width: 100%;
+}
+
+.mrm-action-menu-list {
+  min-width: 160px;
+  padding: 6px;
+  border: 1px solid var(--mrm-border);
+  border-radius: 8px;
+  background: var(--mrm-surface);
+  box-shadow: 0 12px 28px rgba(0, 0, 0, .28);
+}
+
+.mrm-action-menu-portal {
+  --mrm-surface: var(--color-main-background, #1f1f1f);
+  --mrm-border: var(--color-border, #4a4a4a);
+  --mrm-hover: var(--color-background-hover, #333333);
+  --mrm-text: var(--color-main-text, #ffffff);
+  --mrm-primary: var(--color-primary-element, #00679e);
+  --mrm-danger: var(--color-text-error, #ff5757);
+
+  position: fixed;
+  z-index: 1000;
+  width: 176px;
+  display: grid;
+  gap: 2px;
+  box-sizing: border-box;
+  color: var(--mrm-text);
+  background-color: var(--mrm-surface);
+  opacity: 1;
+  isolation: isolate;
+}
+
+.mrm-action-menu-list button {
+  width: 100%;
+  min-height: 34px;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--mrm-text);
+  padding: 7px 10px;
+  font: inherit;
+  font-size: 13px;
+  font-weight: 800;
+  text-align: left;
+  cursor: pointer;
+}
+
+.mrm-action-menu-list button:hover,
+.mrm-action-menu-list button:focus-visible {
+  outline: none;
+  background: color-mix(in srgb, var(--mrm-primary) 22%, var(--mrm-hover));
+  color: var(--mrm-primary);
+}
+
+.mrm-action-menu-list button:active {
+  background: color-mix(in srgb, var(--mrm-primary) 36%, var(--mrm-hover));
+}
+
+.mrm-action-menu-list button.danger {
+  color: var(--mrm-danger);
+}
+
+.mrm-action-menu-list button.danger:hover,
+.mrm-action-menu-list button.danger:focus-visible {
+  background: color-mix(in srgb, var(--mrm-danger) 16%, var(--mrm-hover));
+  color: var(--mrm-danger);
+}
+
 .mrm-file-button input {
   display: none;
 }
@@ -897,6 +1001,19 @@
 .mrm-result {
   display: grid;
   gap: 14px;
+}
+
+.mrm-mailing-section {
+  display: grid;
+  gap: 8px;
+  margin-top: 16px;
+  padding-top: 14px;
+  border-top: 1px solid var(--mrm-border);
+}
+
+.mrm-mailing-section > strong,
+.mrm-mailing-section > p {
+  margin: 0;
 }
 
 .mrm-run-list {
@@ -1172,10 +1289,5 @@
   .mrm-campaign-form .mrm-fields,
   .mrm-campaign-form .mrm-checklist {
     grid-template-columns: 1fr;
-  }
-
-  .mrm-row-actions-compact {
-    grid-template-columns: 1fr;
-    justify-content: stretch;
   }
 }
