@@ -7,7 +7,7 @@ from datetime import datetime as DateTime
 from datetime import time as Time
 from typing import Any
 
-from pydantic import BaseModel, EmailStr, Field, field_validator
+from pydantic import BaseModel, ConfigDict, EmailStr, Field, field_validator
 
 from .models import CampaignOrgLayout, CampaignUploadMode, OrganizationType
 
@@ -165,6 +165,7 @@ class ShareOptionsIn(BaseModel):
 
 
 class ScanIn(BaseModel):
+    batch_id: str | None = None
     path: str | None = None
     allowed_extensions: list[str] | None = None
 
@@ -177,7 +178,9 @@ class BulkPathsIn(BaseModel):
 
 
 class SettingsIn(BaseModel):
-    nc_base_url: str | None = None
+    model_config = ConfigDict(extra="forbid")
+
+    operator_group: str | None = None
     root_path: str | None = None
     collaboration_group: str | None = None
     duplicates_folder: str | None = None
@@ -188,7 +191,7 @@ class SettingsIn(BaseModel):
     share_permissions: int | None = None
     max_file_size: int | None = None
 
-    @field_validator("nc_base_url", "root_path", "collaboration_group", "duplicates_folder", "invalid_folder", "archive_folder", mode="before")
+    @field_validator("operator_group", "root_path", "collaboration_group", "duplicates_folder", "invalid_folder", "archive_folder", mode="before")
     @classmethod
     def strip_optional_text(cls, value):
         return value.strip() if isinstance(value, str) else value

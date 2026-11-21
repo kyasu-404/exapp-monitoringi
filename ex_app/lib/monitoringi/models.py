@@ -7,7 +7,7 @@ from enum import Enum
 from typing import Any
 from uuid import uuid4
 
-from sqlalchemy import Column, UniqueConstraint
+from sqlalchemy import Column, Index, UniqueConstraint, text
 from sqlalchemy import JSON as SAJSON
 from sqlmodel import Field, SQLModel
 
@@ -46,6 +46,7 @@ class CampaignOrganizationStatus(str, Enum):
     accepted = "accepted"
     rejected = "rejected"
     missing = "missing"
+    unverified = "unverified"
 
 
 class CampaignUploadMode(str, Enum):
@@ -126,6 +127,12 @@ class Organization(SQLModel, table=True):
 
 
 class Campaign(SQLModel, table=True):
+    __table_args__ = (
+        Index("uq_campaign_root_path", "campaign_folder_path", unique=True,
+              sqlite_where=text("folder_conflict = false"), postgresql_where=text("folder_conflict = false")),
+        Index("uq_campaign_root_file_id", "folder_file_id", unique=True),
+    )
+
     id: str = Field(default_factory=new_id, primary_key=True)
     title: str = Field(index=True)
     description: str | None = None
@@ -133,6 +140,9 @@ class Campaign(SQLModel, table=True):
     deadline: str | None = None
     parent_nc_path: str
     campaign_folder_path: str
+    participant_selection_explicit: bool = False
+    folder_file_id: str | None = None
+    folder_conflict: bool = False
     selected_org_types: list[str] = Field(default_factory=list, sa_column=Column(SAJSON))
     allowed_extensions: list[str] = Field(default_factory=list, sa_column=Column(SAJSON))
     allowed_mime_types: list[str] = Field(default_factory=list, sa_column=Column(SAJSON))
@@ -157,6 +167,12 @@ class CampaignOrganization(SQLModel, table=True):
     last_file_detected_at: datetime | None = None
     created_at: datetime = Field(default_factory=utcnow)
     updated_at: datetime = Field(default_factory=utcnow)
+
+
+class RetiredParticipantFolder(SQLModel, table=True):
+    campaign_id: str = Field(primary_key=True, foreign_key="campaign.id")
+    relative_path: str = Field(primary_key=True)
+    organization_id: str = Field(primary_key=True, foreign_key="organization.id")
 
 
 class FileRecord(SQLModel, table=True):

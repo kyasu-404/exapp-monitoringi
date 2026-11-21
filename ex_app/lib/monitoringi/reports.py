@@ -250,7 +250,7 @@ def xlsx_bytes(rows: Iterable[dict[str, str]], columns: list[str], *, sheet_name
     return output.getvalue()
 
 
-def report_workbook(campaign: Campaign, files: list[FileRecord], missing: list[Organization]) -> bytes:
+def report_workbook(campaign: Campaign, files: list[FileRecord], missing: list[Organization], check_summary: dict | None = None) -> bytes:
     wb = Workbook()
     summary = wb.active
     summary.title = "Сводка"
@@ -266,6 +266,8 @@ def report_workbook(campaign: Campaign, files: list[FileRecord], missing: list[O
     summary.append(["Неподходящих файлов", counts.get("invalid_extension", 0) + counts.get("invalid_name", 0)])
     summary.append(["Неизвестных организаций", counts.get("unknown", 0)])
     summary.append(["Организаций без файла", len(missing)])
+    check_summary = check_summary or {}
+    summary.append(["Организаций не проверено", check_summary.get("unverified", 0)])
 
     _append_files_sheet(wb, "Корректные файлы", [item for item in files if str(item.classification) == "FileClassification.valid" or item.classification == "valid"])
     missing_sheet = wb.create_sheet("Не предоставили")
@@ -285,8 +287,11 @@ def report_workbook(campaign: Campaign, files: list[FileRecord], missing: list[O
     errors = wb.create_sheet("Ошибки")
     errors.append(["Файл", "Причина"])
     for item in files:
-        if item.reason:
+        if item.reason and item.reason != "not_applicable":
             errors.append(spreadsheet_safe_row([item.original_name, item.reason]))
+
+    for issue in [*check_summary.get("folder_errors", []), *check_summary.get("scan_warnings", [])]:
+        errors.append(spreadsheet_safe_row([issue.get("folder_path") or issue.get("path"), issue["error"]]))
 
     for ws in wb.worksheets:
         for cell in ws[1]:

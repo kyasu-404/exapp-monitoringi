@@ -59,6 +59,7 @@ class FileCandidate:
     size: int | None = None
     mtime: datetime | None = None
     mime_type: str | None = None
+    etag: str | None = None
 
 
 @dataclass(frozen=True)

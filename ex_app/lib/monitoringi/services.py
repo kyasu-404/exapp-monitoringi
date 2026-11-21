@@ -7,12 +7,14 @@ from datetime import date, datetime, time
 from io import BytesIO, StringIO
 from pathlib import PurePosixPath
 from typing import Any
+from unicodedata import normalize
 
 from openpyxl import load_workbook
 from sqlmodel import Session, delete, select
 
 from .algorithms import FileCandidate, classify_files, default_organization_aliases, extension_of, organization_sort_key, plan_renames
 from .config import SETTINGS
+from .errors import AppError
 from .models import (
     AuditLog,
     BatchStatus,
@@ -23,17 +25,19 @@ from .models import (
     CampaignUploadMode,
     FileClassification,
     FileRecord,
+    MessageBatch,
     OperationAction,
     OperationBatch,
     OperationItem,
     OperationItemStatus,
     Organization,
+    RetiredParticipantFolder,
     SettingsEntry,
     utcnow,
 )
 from .nextcloud import NextcloudClient, WebDAVEntry
 from .reports import render_template
-from .security import campaign_folder_path, ensure_under_root, join_nc_path, organization_folder_path
+from .security import campaign_folder_path, ensure_under_root, join_nc_path, normalize_nc_path, organization_folder_path
 
 RUSSIAN_COLUMNS = {
     "Тип ОУ": "type",
@@ -113,10 +117,9 @@ def campaign_type_values(campaign: Campaign, organizations: list[Organization] |
         for item in (campaign.selected_org_types or [])
         if str(item.value if hasattr(item, "value") else item)
     ]
-    if selected:
-        return list(dict.fromkeys(selected))
     values = {organization_type_value(org) for org in organizations or []}
-    return sorted(values, key=lambda item: ORGANIZATION_TYPE_ORDER.index(item) if item in ORGANIZATION_TYPE_ORDER else len(ORGANIZATION_TYPE_ORDER))
+    extra = sorted(values.difference(selected), key=lambda item: ORGANIZATION_TYPE_ORDER.index(item) if item in ORGANIZATION_TYPE_ORDER else len(ORGANIZATION_TYPE_ORDER))
+    return list(dict.fromkeys([*selected, *extra]))
 
 
 def campaign_upload_mode(campaign: Campaign) -> str:
@@ -151,14 +154,6 @@ def campaign_uses_type_folders(campaign: Campaign, organizations: list[Organizat
     return len(campaign_type_values(campaign, organizations)) > 1
 
 
-def current_user_id(headers: dict[str, str]) -> str | None:
-    for key in ("x-nextcloud-user-id", "x-nextcloud-user", "remote-user"):
-        value = headers.get(key) or headers.get(key.title())
-        if value:
-            return value
-    return None
-
-
 def audit(
     session: Session,
     *,
@@ -186,7 +181,7 @@ def audit(
 
 
 def settings_map(session: Session, *, include_secret: bool = False) -> dict[str, Any]:
-    result = {entry.key: entry.value_json for entry in session.exec(select(SettingsEntry)).all()}
+    result = {entry.key: entry.value_json for entry in session.exec(select(SettingsEntry).where(SettingsEntry.key != "nc_base_url")).all()}
     if "nc_app_password" in result and result["nc_app_password"] and not include_secret:
         result["nc_app_password"] = "********"
     return result
@@ -211,7 +206,6 @@ def nextcloud_overrides(session: Session, user_id: str | None = None) -> dict[st
     values = settings_map(session, include_secret=True)
     use_legacy_credentials = not SETTINGS.app_secret
     return {
-        "nc_base_url": values.get("nc_base_url"),
         "nc_user": user_id or (values.get("nc_user") if use_legacy_credentials else None),
         "nc_app_password": values.get("nc_app_password") if use_legacy_credentials else None,
         "root_path": values.get("root_path"),
@@ -409,7 +403,7 @@ def campaign_type_folder_path(campaign: Campaign, type_value: Any) -> str:
 
 def campaign_organization_folder_path(campaign: Campaign, organization: Organization, *, use_type_folder: bool) -> str:
     if use_type_folder:
-        return join_nc_path(campaign_type_folder_path(campaign, organization_type_value(organization)), organization_folder_name(organization))
+        return organization_folder_path(campaign_type_folder_path(campaign, organization_type_value(organization)), organization_folder_name(organization))
     return organization_folder_path(campaign.campaign_folder_path, organization_folder_name(organization))
 
 
@@ -430,70 +424,134 @@ def campaign_organization_upload_path(
     )
 
 
-def _assign_campaign_org_path(
-    item: CampaignOrganization,
-    folder_path: str,
-    *,
-    reset_links_on_change: bool = True,
+def _folder_key(path: str) -> str:
+    return normalize("NFC", normalize_nc_path(path)).casefold()
+
+
+def _check_individual_folder_owners(paths: list[tuple[str, str]]) -> None:
+    owners: dict[str, str] = {}
+    for org_id, path in paths:
+        key = _folder_key(path)
+        if owners.setdefault(key, org_id) != org_id:
+            raise AppError(
+                "ORGANIZATION_FOLDER_CONFLICT",
+                f"Папка «{path}» назначена нескольким ОУ. Выберите структуру «Организации внутри типов» "
+                "или задайте разные коды ОУ. Если папка уже использовалась, удалите её публичные ссылки "
+                "и разберите загруженные файлы вручную.",
+                409,
+            )
+
+
+def campaign_participant_paths(campaign: Campaign, organizations: list[Organization]) -> dict[str, str]:
+    if campaign_uses_organization_folders(campaign):
+        by_type = campaign_uses_type_folders(campaign, organizations)
+        paths = {org.id: campaign_organization_folder_path(campaign, org, use_type_folder=by_type) for org in organizations}
+        _check_individual_folder_owners(list(paths.items()))
+        return paths
+    return {org.id: campaign_organization_upload_path(campaign, org, organizations) for org in organizations}
+
+
+def validate_participant_folders(
+    campaign: Campaign, participants: list[CampaignOrganization], organizations: list[Organization],
+    *, session: Session | None = None,
 ) -> None:
-    if item.folder_path == folder_path:
+    if campaign_uses_organization_folders(campaign):
+        paths = campaign_participant_paths(campaign, organizations)
+        assignments = list(paths.items()) + [(item.organization_id, item.folder_path) for item in participants]
+        _check_individual_folder_owners(assignments)
+        if session is not None:
+            check_retired_participant_folders(session, campaign, assignments)
+
+
+def remember_participant_folder(session: Session, campaign: Campaign, participant: CampaignOrganization) -> None:
+    relative = PurePosixPath(_folder_key(participant.folder_path)).relative_to(_folder_key(campaign.campaign_folder_path))
+    session.merge(RetiredParticipantFolder(
+        campaign_id=campaign.id, relative_path=str(relative), organization_id=participant.organization_id,
+    ))
+
+
+def check_retired_participant_folders(session: Session, campaign: Campaign, assignments: list[tuple[str, str]]) -> None:
+    if not campaign_uses_organization_folders(campaign):
         return
-    item.folder_path = folder_path
-    if reset_links_on_change:
-        item.share_id = None
-        item.public_link = None
+    by_path = {_folder_key(path): org_id for org_id, path in assignments}
+    for retired in session.exec(select(RetiredParticipantFolder).where(RetiredParticipantFolder.campaign_id == campaign.id)):
+        path = join_nc_path(campaign.campaign_folder_path, retired.relative_path)
+        owner = by_path.get(_folder_key(path))
+        if owner is not None and owner != retired.organization_id:
+            raise AppError(
+                "ORGANIZATION_FOLDER_CONFLICT",
+                f"Папка «{path}» ранее принадлежала другому ОУ. Выберите структуру «Организации внутри типов» "
+                "или задайте другой код, чтобы файлы прежнего участника остались в его папке.",
+                409,
+            )
+
+
+def invalidate_participant_plans(session: Session, campaign: Campaign) -> None:
+    operations = session.exec(select(OperationBatch).where(
+        OperationBatch.campaign_id == campaign.id,
+        OperationBatch.operation_type.in_(["create_folders", "create_shares", "delete_shares"]),
+        OperationBatch.status.in_([BatchStatus.preview, BatchStatus.running]),
+    )).all()
+    messages = session.exec(select(MessageBatch).where(
+        MessageBatch.campaign_id == campaign.id,
+        MessageBatch.status.in_([BatchStatus.preview, BatchStatus.running]),
+    )).all()
+    batches = [*operations, *messages]
+    if any(batch.status == BatchStatus.running for batch in batches):
+        raise AppError("PARTICIPANT_OPERATION_RUNNING", "Дождитесь окончания текущей операции мониторинга.", 409)
+    for batch in batches:
+        batch.status = BatchStatus.cancelled
+        batch.finished_at = utcnow()
+        session.add(batch)
+
+
+def reconcile_campaign_orgs(
+    session: Session,
+    campaign: Campaign,
+    organizations: list[Organization],
+    existing: list[CampaignOrganization],
+    *,
+    previous_mode: str,
+) -> list[CampaignOrganization]:
+    paths = campaign_participant_paths(campaign, organizations)
+    check_retired_participant_folders(session, campaign, list(paths.items()))
+    if campaign_uses_organization_folders(campaign):
+        # Never give an existing organization's folder (including its uploaded files) to another.
+        # Switching to genuinely new paths allows repair of older overlapping assignments.
+        desired_keys = {_folder_key(path) for path in paths.values()}
+        occupied = [(item.organization_id, item.folder_path) for item in existing if _folder_key(item.folder_path) in desired_keys]
+        _check_individual_folder_owners(list(paths.items()) + occupied)
+    old = {item.organization_id: item for item in existing}
+    scope_changed = previous_mode != campaign_upload_mode(campaign)
+    affected = [item for item in existing if scope_changed or paths.get(item.organization_id) != item.folder_path]
+    if any(item.share_id or item.public_link for item in affected):
+        raise AppError(
+            "PARTICIPANT_LINKS_IN_USE",
+            "Изменение затрагивает действующие ссылки участников. В разделе «Ссылки» удалите ссылки, "
+            "затем сохраните изменения и создайте новые ссылки.",
+            409,
+        )
+    if affected or old.keys() != paths.keys() or scope_changed:
+        invalidate_participant_plans(session, campaign)
+    for item in affected:
+        remember_participant_folder(session, campaign, item)
+        if item.organization_id not in paths:
+            session.delete(item)
+            continue
+        item.folder_path = paths[item.organization_id]
+        item.status = CampaignOrganizationStatus.pending
+        item.last_file_detected_at = None
         item.mail_subject = None
         item.mail_body = None
-        if item.status != CampaignOrganizationStatus.pending:
-            item.status = CampaignOrganizationStatus.pending
-    item.updated_at = utcnow()
-
-
-def create_campaign_orgs(session: Session, campaign: Campaign, organizations: list[Organization]) -> list[CampaignOrganization]:
-    existing = {
-        item.organization_id: item
-        for item in session.exec(select(CampaignOrganization).where(CampaignOrganization.campaign_id == campaign.id)).all()
-    }
-    result: list[CampaignOrganization] = []
-    for org in organizations:
-        folder_path = campaign_organization_upload_path(campaign, org, organizations)
-        item = existing.get(org.id)
+        item.updated_at = utcnow()
+    result = []
+    for org_id, path in paths.items():
+        item = old.get(org_id)
         if item is None:
-            item = CampaignOrganization(campaign_id=campaign.id, organization_id=org.id, folder_path=folder_path)
-        else:
-            _assign_campaign_org_path(item, folder_path)
-        session.add(item)
+            item = CampaignOrganization(campaign_id=campaign.id, organization_id=org_id, folder_path=path)
+            session.add(item)
         result.append(item)
-    session.commit()
     return result
-
-
-def sync_campaign_orgs(session: Session, campaign: Campaign, organizations: list[Organization]) -> list[CampaignOrganization]:
-    existing = {
-        item.organization_id: item
-        for item in session.exec(select(CampaignOrganization).where(CampaignOrganization.campaign_id == campaign.id)).all()
-    }
-    changed = False
-    for org in organizations:
-        folder_path = campaign_organization_upload_path(campaign, org, organizations)
-        if org.id in existing:
-            before = existing[org.id].folder_path
-            _assign_campaign_org_path(existing[org.id], folder_path)
-            if existing[org.id].folder_path != before:
-                session.add(existing[org.id])
-                changed = True
-            continue
-        item = CampaignOrganization(
-            campaign_id=campaign.id,
-            organization_id=org.id,
-            folder_path=folder_path,
-        )
-        session.add(item)
-        existing[org.id] = item
-        changed = True
-    if changed:
-        session.commit()
-    return list(existing.values())
 
 
 def create_batch(
@@ -512,8 +570,7 @@ def create_batch(
         summary_json=summary or {},
     )
     session.add(batch)
-    session.commit()
-    session.refresh(batch)
+    session.flush()
     for item in items or []:
         session.add(
             OperationItem(
@@ -590,6 +647,7 @@ def campaign_share_targets(
     campaign_orgs: list[CampaignOrganization],
     organizations: list[Organization] | None = None,
 ) -> list[dict[str, Any]]:
+    validate_participant_folders(campaign, campaign_orgs, organizations or [])
     org_by_id = {org.id: org for org in organizations or []}
     mode = campaign_upload_mode(campaign)
     linked_items = [item for item in campaign_orgs if item.organization_id in org_by_id or not org_by_id]
@@ -645,6 +703,7 @@ def planned_folder_items(
     organizations: list[Organization] | None = None,
     existing_folder_paths: set[str] | None = None,
 ) -> list[dict[str, Any]]:
+    validate_participant_folders(campaign, campaign_orgs, organizations or [])
     org_by_id = {org.id: org for org in organizations or []}
     items: list[dict[str, Any]] = []
     use_type_folder = campaign_uses_type_folders(campaign, organizations)
@@ -678,6 +737,12 @@ def planned_folder_items(
                 }
             )
         if item.folder_path != desired_path:
+            if item.share_id or item.public_link:
+                raise AppError(
+                    "PARTICIPANT_LINKS_IN_USE",
+                    "Перед сменой папки ОУ удалите публичные ссылки в разделе «Ссылки».",
+                    409,
+                )
             if existing_folder_paths is not None:
                 source_exists = item.folder_path in existing_folder_paths
                 desired_exists = desired_path in existing_folder_paths
@@ -756,6 +821,7 @@ def entries_to_candidates(entries: list[WebDAVEntry], *, skip_root: str) -> list
                 size=entry.size,
                 mtime=entry.mtime,
                 mime_type=entry.mime_type,
+                etag=entry.etag,
             )
         )
     return candidates
@@ -767,6 +833,7 @@ def persist_scan_results(
     classified,
     campaign_orgs: list[CampaignOrganization],
     current_paths: dict[str, str] | None = None,
+    unverified_org_ids: set[str] | None = None,
 ) -> None:
     current_paths = current_paths or {}
     session.exec(delete(FileRecord).where(FileRecord.campaign_id == campaign.id))
@@ -799,13 +866,15 @@ def persist_scan_results(
         if org_id in uploaded_org_ids:
             campaign_org.status = CampaignOrganizationStatus.uploaded
             campaign_org.last_file_detected_at = utcnow()
+        elif org_id in (unverified_org_ids or set()):
+            campaign_org.status = CampaignOrganizationStatus.unverified
         elif org_id in rejected_org_ids:
             campaign_org.status = CampaignOrganizationStatus.rejected
         else:
             campaign_org.status = CampaignOrganizationStatus.missing
         campaign_org.updated_at = utcnow()
         session.add(campaign_org)
-    session.commit()
+    session.flush()
 
 
 def missing_organizations(
