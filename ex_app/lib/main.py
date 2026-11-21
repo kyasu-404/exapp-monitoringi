@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
+import asyncio
 import os
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 from pathlib import Path
 
 from fastapi import FastAPI, HTTPException, Request
@@ -14,6 +15,7 @@ from nc_py_api.ex_app import AppAPIAuthMiddleware, LogLvl, run_app, set_handlers
 from monitoringi.api import router as api_router
 from monitoringi.db import init_db
 from monitoringi.errors import AppError
+from monitoringi.mail_queue import run_mail_queue
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 
@@ -32,10 +34,16 @@ def _safe_asset(root: Path, path: str, media_type: str | None = None) -> FileRes
 async def lifespan(app: FastAPI):
     init_db()
     set_handlers(app, enabled_handler)
-    yield
+    worker = asyncio.create_task(run_mail_queue())
+    try:
+        yield
+    finally:
+        worker.cancel()
+        with suppress(asyncio.CancelledError):
+            await worker
 
 
-APP = FastAPI(title="Monitoring Request Manager", version="0.1.0", lifespan=lifespan)
+APP = FastAPI(title="Monitoring Request Manager", version="1.1.0", lifespan=lifespan)
 APP.add_middleware(AppAPIAuthMiddleware)
 APP.include_router(api_router)
 

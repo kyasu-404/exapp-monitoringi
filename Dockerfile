@@ -48,7 +48,6 @@ RUN apt-get update && apt-get install -y --no-install-recommends curl procps ca-
 ADD /ex_app/cs[s] /ex_app/css
 ADD /ex_app/im[g] /ex_app/img
 ADD /ex_app/j[s] /ex_app/js
-ADD /ex_app/sr[c] /ex_app/src
 ADD /ex_app/li[b] /ex_app/lib
 
 COPY --chmod=775 healthcheck.sh /

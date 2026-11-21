@@ -152,3 +152,24 @@ def test_root_access_fallback_can_create_group_share_on_save():
     assert result["mode"] == "group_share_fallback"
     assert client.created_share is True
     assert result["group_share_permissions"] == GROUP_SHARE_PERMISSIONS
+
+
+def test_exclusive_mkcol_detects_existing_collection():
+    from monitoringi.errors import NextcloudApiError
+
+    async def scenario():
+        client = NextcloudClient(NextcloudCredentials(base_url="https://nc.test", user="alice", root_path="/", app_password="test"))
+        await client.aclose()
+        client._client = httpx.AsyncClient(
+            transport=httpx.MockTransport(lambda request: httpx.Response(405)), base_url="https://nc.test",
+        )
+        async with client:
+            await client.mkcol("/existing")
+            try:
+                await client.mkcol("/existing", exclusive=True)
+            except NextcloudApiError as exc:
+                assert (exc.code, exc.status_code) == ("CAMPAIGN_TARGET_EXISTS", 409)
+            else:
+                raise AssertionError("exclusive MKCOL accepted an existing collection")
+
+    asyncio.run(scenario())

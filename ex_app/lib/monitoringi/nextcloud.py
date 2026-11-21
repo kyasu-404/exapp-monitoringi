@@ -51,14 +51,16 @@ class WebDAVEntry:
 
 def configured_credentials(overrides: dict | None = None) -> NextcloudCredentials:
     overrides = overrides or {}
-    base_url = overrides.get("nc_base_url") or SETTINGS.nc_base_url
+    if "nc_base_url" in overrides:
+        raise NextcloudApiError("NEXTCLOUD_URL_OVERRIDE", "Адрес Nextcloud задаётся при развёртывании.", 400)
+    base_url = SETTINGS.nc_base_url
     user = overrides.get("nc_user") or SETTINGS.nc_user
-    app_password = overrides.get("nc_app_password") or SETTINGS.nc_app_password
+    app_password = None if SETTINGS.app_secret else (overrides.get("nc_app_password") or SETTINGS.nc_app_password)
     root_path = overrides.get("root_path") or SETTINGS.root_path
-    app_secret = overrides.get("app_secret") or SETTINGS.app_secret
-    app_id = overrides.get("app_id") or SETTINGS.app_id
-    app_version = overrides.get("app_version") or SETTINGS.app_version
-    aa_version = overrides.get("aa_version") or SETTINGS.aa_version
+    app_secret = SETTINGS.app_secret
+    app_id = SETTINGS.app_id
+    app_version = SETTINGS.app_version
+    aa_version = SETTINGS.aa_version
     if not base_url or not user:
         raise NextcloudApiError(
             "NEXTCLOUD_SETTINGS_INCOMPLETE",
@@ -137,6 +139,7 @@ class NextcloudClient:
             )
         self._client = httpx.AsyncClient(
             base_url=self.credentials.base_url,
+            follow_redirects=False,
             auth=auth,
             timeout=SETTINGS.request_timeout,
             headers=headers,
@@ -186,19 +189,20 @@ class NextcloudClient:
             raise NextcloudApiError("WEBDAV_PATH_NOT_FOUND", "Путь WebDAV не найден.", 404)
         if response.status_code >= 400:
             raise NextcloudApiError("WEBDAV_PROPFIND_FAILED", "Не удалось получить список файлов.", 502, response.text)
-        return self._parse_multistatus(response.text)
+        try:
+            return self._parse_multistatus(response.text)
+        except ET.ParseError as exc:
+            raise NextcloudApiError("WEBDAV_INVALID_LISTING", "WebDAV вернул неполный список файлов.", 502) from exc
 
     def _prop_from_response(self, item: ET.Element) -> ET.Element | None:
-        fallback: ET.Element | None = None
         for propstat in item.findall("d:propstat", DAV_NS):
             prop = propstat.find("d:prop", DAV_NS)
             if prop is None:
                 continue
-            fallback = fallback or prop
             status = propstat.findtext("d:status", default="", namespaces=DAV_NS)
             if " 200 " in f" {status} ":
                 return prop
-        return fallback
+        return None
 
     def _parse_multistatus(self, xml_text: str) -> list[WebDAVEntry]:
         root = ET.fromstring(xml_text)
@@ -208,8 +212,8 @@ class NextcloudClient:
             href = unquote(item.findtext("d:href", default="", namespaces=DAV_NS))
             path = "/" + href.split(prefix, 1)[-1].strip("/")
             prop = self._prop_from_response(item)
-            if prop is None:
-                continue
+            if prop is None or prop.find("d:resourcetype", DAV_NS) is None:
+                raise NextcloudApiError("WEBDAV_INCOMPLETE_LISTING", "WebDAV не вернул сведения обо всех запрошенных объектах.", 502)
             is_collection = prop.find("d:resourcetype/d:collection", DAV_NS) is not None
             length = prop.findtext("d:getcontentlength", default=None, namespaces=DAV_NS)
             mime_type = prop.findtext("d:getcontenttype", default=None, namespaces=DAV_NS)
@@ -235,25 +239,32 @@ class NextcloudClient:
             )
         return result
 
-    async def mkcol(self, path: str) -> None:
+    async def mkcol(self, path: str, *, exclusive: bool = False) -> None:
         response = await self._client.request("MKCOL", self._dav_url(path))
+        if response.status_code == 405 and exclusive:
+            raise NextcloudApiError("CAMPAIGN_TARGET_EXISTS", "Путь новой папки уже занят.", 409, path)
         if response.status_code in {201, 405}:
             return
         if response.status_code in {401, 403}:
             raise NextcloudApiError("WEBDAV_FORBIDDEN", "Нет прав на создание папки WebDAV.", response.status_code)
         raise NextcloudApiError("WEBDAV_MKCOL_FAILED", "Не удалось создать папку WebDAV.", 502, response.text)
 
-    async def move(self, source_path: str, target_path: str, *, overwrite: bool = False) -> None:
+    async def move(self, source_path: str, target_path: str, *, overwrite: bool = False, expected_etag: str | None = None) -> None:
         source = self._safe_path(source_path)
         target = self._safe_path(target_path)
         destination = f"{self.credentials.base_url}{self._dav_url(target)}"
+        headers = {"Destination": destination, "Overwrite": "T" if overwrite else "F"}
+        if expected_etag is not None:
+            headers["If-Match"] = expected_etag
         response = await self._client.request(
             "MOVE",
             self._dav_url(source),
-            headers={"Destination": destination, "Overwrite": "T" if overwrite else "F"},
+            headers=headers,
         )
         if response.status_code in {201, 204}:
             return
+        if expected_etag is not None and response.status_code in {404, 412}:
+            raise NextcloudApiError("SCAN_PRECONDITION_FAILED", "Исходный файл изменился или целевой путь занят. Повторите проверку.", 409)
         if response.status_code == 412:
             raise NextcloudApiError("FILE_ALREADY_EXISTS", "Целевой файл уже существует.", 409, response.text)
         raise NextcloudApiError("WEBDAV_MOVE_FAILED", "Не удалось переместить файл через WebDAV.", 502, response.text)
@@ -378,6 +389,29 @@ class NextcloudClient:
             raise NextcloudApiError("SHARE_API_FAILED", str(meta.get("message") or "Ошибка OCS Share API."), 502)
         data = payload.get("data", [])
         return data if isinstance(data, list) else []
+
+    async def current_user_groups(self) -> set[str]:
+        """Read group IDs from the deployment's profile for this authenticated caller."""
+        unavailable = NextcloudApiError("GROUP_LOOKUP_FAILED", "Не удалось подтвердить группы пользователя Nextcloud.", 503)
+        try:
+            response = await self._client.get(
+                "/ocs/v2.php/cloud/user",
+                params={"format": "json"},
+                headers={"OCS-APIRequest": "true", "Accept": "application/json"},
+            )
+            response.raise_for_status()
+            ocs = response.json()["ocs"]
+            if ocs["meta"]["statuscode"] not in (100, 200):
+                raise unavailable
+            profile = ocs["data"]
+            if profile["id"] != self.credentials.user:
+                raise unavailable
+            groups = profile["groups"]
+            if not isinstance(groups, list) or not all(isinstance(group, str) for group in groups):
+                raise unavailable
+            return set(groups)
+        except (httpx.HTTPError, KeyError, ValueError, TypeError) as exc:
+            raise unavailable from exc
 
     async def list_groups(self, *, search: str = "", limit: int = 200) -> list[str]:
         params = {"format": "json", "search": search, "limit": limit}
@@ -544,9 +578,13 @@ class NextcloudClient:
             json={"to": to_email, "subject": subject, "body": body},
             headers={"X-OO-File-Collector-Token": token},
         )
-        if response.status_code in {200, 201, 202, 204}:
-            return
-        raise NextcloudApiError("NEXTCLOUD_MAIL_SEND_FAILED", "Nextcloud не отправил письмо через почтовый мост.", 502, response.text)
+        if response.status_code in {400, 401, 403, 404, 405, 413, 415, 422}:
+            raise NextcloudApiError("NEXTCLOUD_MAIL_SEND_FAILED", "Почтовый мост отклонил запрос.", 502)
+        if response.is_success:
+            with suppress(ValueError):
+                if response.json() == {"status": "sent"}:
+                    return
+        raise NextcloudApiError("MAIL_DELIVERY_UNCONFIRMED", "Почтовый мост не подтвердил отправку письма.", 502)
 
     async def test_webdav(self) -> dict[str, str | int | bool | None | list[str]]:
         entries = await self.propfind(self.credentials.root_path, depth=0)

@@ -5,7 +5,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Iterator
 
-from sqlalchemy import text
+from sqlalchemy import inspect, text
 from sqlmodel import Session, SQLModel, create_engine, select
 
 from .config import SETTINGS
@@ -45,13 +45,35 @@ def get_engine():
 
 
 def _ensure_campaign_columns(session: Session) -> None:
-    if not SETTINGS.database_url.startswith("sqlite"):
-        return
-    columns = {row[1] for row in session.exec(text("PRAGMA table_info(campaign)")).all()}
+    columns = {column["name"] for column in inspect(session.connection()).get_columns("campaign")}
+    if "participant_selection_explicit" not in columns:
+        session.exec(text("ALTER TABLE campaign ADD COLUMN participant_selection_explicit BOOLEAN DEFAULT FALSE NOT NULL"))
+        session.exec(text(
+            "UPDATE campaign SET participant_selection_explicit = TRUE WHERE EXISTS ("
+            "SELECT 1 FROM auditlog WHERE auditlog.entity_type = 'campaign' "
+            "AND auditlog.entity_id = campaign.id AND auditlog.action = 'select_organizations')"
+        ))
     if "upload_mode" not in columns:
         session.exec(text("ALTER TABLE campaign ADD COLUMN upload_mode VARCHAR DEFAULT 'organization' NOT NULL"))
     if "org_folder_layout" not in columns:
         session.exec(text("ALTER TABLE campaign ADD COLUMN org_folder_layout VARCHAR DEFAULT 'auto' NOT NULL"))
+
+    if "folder_file_id" not in columns:
+        session.exec(text("ALTER TABLE campaign ADD COLUMN folder_file_id VARCHAR"))
+    if "folder_conflict" not in columns:
+        session.exec(text("ALTER TABLE campaign ADD COLUMN folder_conflict BOOLEAN DEFAULT false NOT NULL"))
+    # Idempotent if an earlier startup stopped between ALTER and index creation.
+    session.exec(text("""
+        UPDATE campaign SET folder_conflict = true
+        WHERE folder_conflict = false AND campaign_folder_path IN (
+            SELECT campaign_folder_path FROM campaign GROUP BY campaign_folder_path HAVING count(*) > 1
+        )
+    """))
+    session.exec(text("""
+        CREATE UNIQUE INDEX IF NOT EXISTS uq_campaign_root_path
+        ON campaign (campaign_folder_path) WHERE folder_conflict = false
+    """))
+    session.exec(text("CREATE UNIQUE INDEX IF NOT EXISTS uq_campaign_root_file_id ON campaign (folder_file_id)"))
 
 
 def init_db() -> None:
@@ -61,6 +83,9 @@ def init_db() -> None:
     SQLModel.metadata.create_all(get_engine())
     with Session(get_engine()) as session:
         _ensure_campaign_columns(session)
+        if session.get_bind().dialect.name == "postgresql":
+            session.exec(text("ALTER TYPE campaignorganizationstatus ADD VALUE IF NOT EXISTS 'unverified'"))
+            session.exec(text("ALTER TYPE mailitemstatus ADD VALUE IF NOT EXISTS 'unknown'"))
         session.exec(text("CREATE UNIQUE INDEX IF NOT EXISTS uq_organization_type_code ON organization (type, code)"))
         default_template = session.exec(select(MailTemplate).where(MailTemplate.is_default == True)).first()  # noqa: E712
         if default_template is None:

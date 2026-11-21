@@ -23,6 +23,8 @@
       groupsLoading: false,
       recentUploads: [],
       settings: {},
+      isAdmin: null,
+      accessError: "",
       selectedCampaignId: window.localStorage?.getItem("mrmSelectedCampaignId") || "",
       editingOrganizationId: "",
       editingCampaignId: "",
@@ -89,12 +91,14 @@
       accepted: "Принято",
       rejected: "Отклонено",
       missing: "Нет файла",
+      unverified: "Не проверено",
       preview: "Предпросмотр",
       running: "Выполняется",
       completed: "Завершено",
       completed_with_errors: "Завершено с ошибками",
       failed: "Ошибка",
       cancelled: "Отменено",
+      delivery_unknown: "Доставка не подтверждена",
       sending: "Отправляется",
       sent: "Отправлено",
       bounced: "Не доставлено",
@@ -215,15 +219,26 @@
 
     async function loadBase() {
       try {
-        const [organizations, campaigns, settings, recentUploads] = await Promise.all([
+        const access = await api("/access")
+        state.isAdmin = access.is_admin
+        state.accessError = ""
+        if (!state.isAdmin && state.view === "settings") state.view = "dashboard"
+        state.settings = state.isAdmin ? await api("/settings") : access.defaults
+        render()
+      } catch (error) {
+        state.isAdmin = null
+        state.accessError = error.message
+        render()
+        return
+      }
+      try {
+        const [organizations, campaigns, recentUploads] = await Promise.all([
           api("/organizations?active=true"),
           api("/campaigns"),
-          api("/settings"),
           api("/recent-uploads?limit=10").catch(() => []),
         ])
         state.organizations = organizations
         state.campaigns = campaigns
-        state.settings = settings
         state.recentUploads = recentUploads
         const previousCampaignId = state.selectedCampaignId
         if (!campaigns.some((campaign) => campaign.id === state.selectedCampaignId)) {
@@ -564,7 +579,7 @@
 
     function statusPill(status) {
       const ok = ["active", "uploaded", "accepted", "completed", "links_created", "success", "valid", "sent"]
-      const warn = ["draft", "preview", "missing", "completed_with_errors", "folders_created", "planned", "skipped", "duplicate", "unknown", "sending", "pending"]
+      const warn = ["draft", "preview", "missing", "unverified", "completed_with_errors", "folders_created", "planned", "skipped", "duplicate", "unknown", "delivery_unknown", "sending", "pending"]
       const errors = ["failed", "invalid_extension", "invalid_name", "trash", "bounced"]
       const cls = ok.includes(status) ? "ok" : warn.includes(status) ? "warn" : errors.includes(status) ? "error" : ""
       return `<span class="mrm-pill ${cls}">${h(statusLabels[status] || status)}</span>`
@@ -628,12 +643,16 @@
       planned: "Запланировано",
       pending: "К отправке",
       sent: "Отправлено",
+      sending: "Отправляется",
+      delivery_unknown: "Доставка не подтверждена",
+      queued_by: "Отправитель",
       already_ok: "Уже в порядке",
       skipped: "Пропущено",
       trash_moved: "Перемещено в Мусор",
       duplicates_moved: "Перемещено в Дубли",
       renamed: "Переименовано",
       operation_errors: "Ошибок обработки",
+      unverified: "Организаций не проверено",
       success: "Успешно",
       failed: "Ошибок",
       valid: "Принято",
@@ -653,6 +672,9 @@
     function resultNote(result) {
       const status = result.status || ""
       const folderPresenceOnly = result.operation_type === "scan" && result.summary?.folder_presence_only
+      if (folderPresenceOnly && result.summary?.unverified) {
+        return "Часть папок не проверена. Эти организации исключены из напоминаний. Повторите проверку после восстановления доступа."
+      }
       if (folderPresenceOnly && status === "preview") {
         return "Папки организаций проверены без сохранения. Файлы не переименовывались и не перемещались."
       }
@@ -666,7 +688,7 @@
         return "Результат сохранён: неправильные файлы перенесены в «Мусор», дубли в «Дубли», оставшиеся актуальные файлы переименованы."
       }
       if (result.operation_type === "scan" && status === "completed_with_errors") {
-        return "Результат сохранён частично. Строки с ошибками обработки нужно проверить вручную."
+        return "Сохранены проверенные файлы из предпросмотра. Изменения после предпросмотра и ошибки перечислены в выводе. Повторите проверку."
       }
       if (result.operation_type === "rename" && status === "preview") {
         return "Это план массового переименования по шаблону. Файлы ещё не изменены."
@@ -768,7 +790,7 @@
                     <tr>
                       <td>${h(org)}</td>
                       <td>${email ? h(email) : `<span class="mrm-muted-line">не указан</span>`}</td>
-                      <td>${statusPill(item.status)}</td>
+                      <td>${statusPill(item.status === "unknown" ? "delivery_unknown" : item.status)}</td>
                       <td class="is-wrap">${h(item.subject || "")}</td>
                       <td class="is-wrap">${h(item.last_error || item.error || "")}</td>
                     </tr>
@@ -829,6 +851,7 @@
             </div>
             <nav class="mrm-nav">
               ${views
+                .filter(([id]) => id !== "settings" || state.isAdmin)
                 .map(
                   ([id, icon, label]) => `
                     <button type="button" data-view="${id}" class="${state.view === id ? "is-active" : ""}" title="${h(label)}">
@@ -965,7 +988,7 @@
               <div class="mrm-actions">
                 <label class="mrm-file-button">Импорт XLSX/CSV<input type="file" data-import-organizations accept=".csv,.xlsx"></label>
                 <button class="mrm-button" type="button" data-download="organizations.xlsx">Экспорт XLSX</button>
-                <button class="mrm-button danger" type="button" data-delete-all-organizations>Удалить все</button>
+                ${state.isAdmin ? '<button class="mrm-button danger" type="button" data-delete-all-organizations>Удалить все</button>' : ""}
               </div>
             </div>
             <div class="mrm-panel-body">
@@ -1008,6 +1031,7 @@
               <td class="mrm-campaign-title-cell">
                 <strong>${h(item.title)}</strong>
                 <span>${h(item.campaign_folder_path)}</span>
+                ${item.folder_conflict ? "<span>Общая папка старых мониторингов. Создайте отдельный мониторинг для продолжения сбора.</span>" : ""}
               </td>
               <td><div class="mrm-chip-row">${typeChips || `<span class="mrm-muted-line">—</span>`}</div></td>
               <td><div class="mrm-chip-row">${settingsChips}</div></td>
@@ -1049,7 +1073,7 @@
             <h3>${editing ? "Редактирование" : "Мониторинг"}</h3>
             <div class="mrm-fields">
               <div class="mrm-field"><label>Название</label><input name="title" value="${h(editing?.title)}" required></div>
-              <div class="mrm-field"><label>Срок сдачи</label><input name="deadline" type="date" value="${h(editing?.deadline)}"></div>
+              <div class="mrm-field"><label>Срок сдачи</label><input name="deadline" type="date" value="${h(editing?.deadline?.slice(0, 10))}"></div>
               <div class="mrm-field">
                 <label>Путь</label>
                 <div class="mrm-input-action">
@@ -1128,7 +1152,13 @@
                 </div>
               </div>
               <div class="mrm-field">
-                <label>Группа доступа</label>
+                <label>Группа операторов приложения</label>
+                <select name="operator_group">
+                  ${groupOptions(state.settings.operator_group)}
+                </select>
+              </div>
+              <div class="mrm-field">
+                <label>Группа доступа к папке</label>
                 <div class="mrm-input-action">
                   <select name="collaboration_group" data-group-select>
                     ${groupOptions(collaborationGroup)}
@@ -1152,7 +1182,7 @@
 
     function checkSummaryText(summary = {}) {
       if (summary.folder_presence_only) {
-        return `Папок с файлами: ${summary.folders_with_files || 0}; Пустых папок: ${summary.folders_without_files || 0}; Не предоставили: ${summary.missing || 0}`
+        return `Папок с файлами: ${summary.folders_with_files || 0}; Пустых папок: ${summary.folders_without_files || 0}; Не проверено: ${summary.unverified || 0}; Не предоставили: ${summary.missing || 0}`
       }
       return `Файлов найдено: ${summary.total || 0}; Корректных: ${summary.valid || 0}; Дублей: ${summary.duplicate || 0}; Неподходящих: ${(summary.invalid_extension || 0) + (summary.invalid_name || 0) + (summary.unknown || 0)}; Не предоставили: ${summary.missing || 0}`
     }
@@ -1256,6 +1286,9 @@
         const notApplicable = summary.folder_presence_only ? "Не применимо" : null
         return [
           { label: "Операция запускалась", value: runDate(runStartedAt(run)) },
+          { label: "Организаций не проверено", value: summary.unverified || 0 },
+          { label: "Пропущено файлов", value: summary.skipped || 0 },
+          { label: "Ошибок проверки", value: summary.operation_errors || 0 },
           { label: "Нормализовано файлов", value: notApplicable ?? summary.renamed ?? 0 },
           { label: "Помещено в дубли", value: notApplicable ?? summary.duplicates_moved ?? 0 },
           { label: "Помещено в мусор", value: notApplicable ?? summary.trash_moved ?? 0 },
@@ -1269,7 +1302,13 @@
           { label: "Не предоставлено", value: summary.missing ?? summary.planned ?? 0 },
           { label: "Не предоставившие ОУ", value: summary.missing_organization_names || summary.missing_organization_codes || "" },
           { label: "Из них без Email", value: summary.without_email ?? summary.failed ?? 0 },
-          { label: "Последняя рассылка напоминаний", value: runDate(run.finished_at || run.queued_at || "") },
+          { label: "Отправитель", value: summary.queued_by || "" },
+          { label: "В очереди", value: summary.pending ?? 0 },
+          { label: "Отправляется", value: summary.sending ?? 0 },
+          { label: "Отправлено", value: summary.sent ?? 0 },
+          { label: "Ошибок отправки", value: summary.failed ?? 0 },
+          { label: "Доставка не подтверждена", value: summary.delivery_unknown ?? 0 },
+          { label: "Последняя рассылка", value: runDate(run.finished_at || run.queued_at || "") },
           { label: "Превью рассылки", value: summary.preview_text || "", long: true },
         ]
       }
@@ -1292,8 +1331,13 @@
 
     function operationRunDetails(tab, run) {
       if (run.operation_type === "messages") return messageRows(run.items || [])
-      if (tab === "scan" && run.files) return fileRows(run.files || [])
-      if (tab === "scan" && run.cleanup_batch?.items?.length) return operationRows(run.cleanup_batch.items, "scan_cleanup")
+      if (tab === "scan") {
+        const summary = run.summary || {}
+        const warnings = [...(summary.folder_errors || []), ...(summary.scan_warnings || [])]
+        const details = warnings.map((item) => `<li>${h([item.organization_name, item.folder_path || item.path, item.error].filter(Boolean).join(" · "))}</li>`).join("")
+        const files = run.files ? fileRows(run.files) : run.cleanup_batch ? operationRows(run.cleanup_batch.items || [], "scan_cleanup") : ""
+        return `${details ? `<p>Повторите проверку после устранения причин пропуска.</p><ul>${details}</ul>` : ""}${files || (details ? "" : '<div class="mrm-empty">Проверка завершена.</div>')}`
+      }
       if (run.items) return operationRows(run.items, run.operation_type)
       return `<div class="mrm-empty">Детальные строки для этого запуска не сохранены.</div>`
     }
@@ -1310,6 +1354,10 @@
             ${run.status ? statusPill(run.status) : ""}
           </div>
           ${summaryRows(operationRunSummaryRows(tab, run))}
+          ${tab === "messages" && run.status === "preview" && run.summary?.needs_confirmation
+            ? `<p>Для продолжения сохранённой рассылки требуется подтверждение отправителя.</p>
+               <button class="mrm-button" type="button" data-resume-mail="${h(run.batch_id)}">Отправить оставшиеся письма (${h(run.summary.pending)})</button>`
+            : ""}
           <details>
             <summary>Вывод запуска</summary>
             ${operationRunDetails(tab, run)}
@@ -1398,7 +1446,7 @@
             <span>Проверка</span>
             <strong>Очистка от дублей и мусора</strong>
             <p>${folderPresenceOnly ? "Для структуры с отдельными папками организаций проверяет только, что папка не пустая. Файлы не переименовываются и не перемещаются." : "Проверяет загруженные файлы, переносит лишнее и нормализует имена актуальных файлов."}</p>
-            <div class="mrm-actions"><button class="mrm-button" type="button" data-op="scan-preview">Проверить файлы</button><button class="mrm-button primary" type="button" data-op="scan-apply">Сохранить результат</button></div>
+            <div class="mrm-actions"><button class="mrm-button" type="button" data-op="scan-preview">Проверить файлы</button><button class="mrm-button primary" type="button" data-op="scan-apply" ${folderPresenceOnly || state.operationBatches.scan ? "" : "disabled"}>Сохранить результат</button></div>
           </div>
         `
       }
@@ -1511,6 +1559,10 @@
     }
 
     function render() {
+      if (state.isAdmin === null) {
+        root.textContent = state.accessError || "Проверка доступа…"
+        return
+      }
       const map = { dashboard, organizations, campaigns, operations, settings }
       const view = map[state.view] || dashboard
       root.innerHTML = view() + campaignMenuPortal()
@@ -1539,13 +1591,17 @@
           data[key] = [data[key], value]
         }
       }
+      if (form.dataset.form === "campaign" && !data.deadline) data.deadline = null
       if (data.selected_org_types && !Array.isArray(data.selected_org_types)) data.selected_org_types = [data.selected_org_types]
       if (!data.selected_org_types && form.dataset.form === "campaign") data.selected_org_types = []
       if (form.dataset.form === "campaign" && data.upload_mode !== "organization") data.org_folder_layout = "auto"
       if (data.allowed_extensions) data.allowed_extensions = String(data.allowed_extensions).split(",").map((item) => item.trim()).filter(Boolean)
       if (!data.allowed_extensions && form.dataset.form === "campaign") data.allowed_extensions = []
       if (data.default_extensions) data.default_extensions = String(data.default_extensions).split(",").map((item) => item.trim()).filter(Boolean)
-      if (form.dataset.form === "settings") data.collaboration_group = form.elements.collaboration_group?.value.trim() || ""
+      if (form.dataset.form === "settings") {
+        data.collaboration_group = form.elements.collaboration_group.value.trim()
+        data.operator_group = form.elements.operator_group.value.trim()
+      }
       if (form.dataset.form === "organization") {
         data.email = form.elements.email.value.trim() || null
         const aliases = form.elements.aliases.value.split(/[;,]/).map((item) => item.trim()).filter(Boolean)
@@ -1715,7 +1771,7 @@
           kind: "scan",
           phase: "direct",
           path: `/campaigns/${id}/scan/apply`,
-          options: {},
+          options: (batchId) => campaign?.upload_mode === "organization" ? {} : withJson({ batch_id: batchId }),
         },
         "messages-preview": {
           kind: "messages",
@@ -1790,7 +1846,7 @@
           await finishOperationView()
           return
         }
-        if ((batch.summary?.pending || 0) <= 0) {
+        if ((batch.summary?.pending ?? batch.summary_json?.pending ?? 0) <= 0) {
           state.lastBatch = batch
           state.operationTab = "messages"
           setNotice("Нет писем, готовых к отправке", true)
@@ -1823,7 +1879,13 @@
       if (operation.phase === "apply" && !state.operationBatches[operation.kind]) {
         await runConfigured(operations[operation.preview])
       }
-      const result = await runConfigured(operation)
+      if (op === "scan-preview") delete state.operationBatches.scan
+      let result
+      try {
+        result = await runConfigured(operation)
+      } finally {
+        if (op === "scan-apply") delete state.operationBatches.scan
+      }
       const resultTab = operationTabForResult(result)
       if (resultTab) state.operationTab = resultTab
       if (operation.phase === "apply") delete state.operationBatches[operation.kind]
@@ -1857,7 +1919,10 @@
     async function archiveCampaign(campaignId) {
       const campaign = state.campaigns.find((item) => item.id === campaignId)
       const title = campaign?.title ? ` «${campaign.title}»` : ""
-      if (!window.confirm(`Переместить мониторинг${title} в архив и удалить его публичные ссылки? Файлы останутся в папке архива.`)) return
+      const confirmation = campaign?.folder_conflict
+        ? `Архивировать карточку мониторинга${title}? Общая папка и её публичные ссылки останутся на месте.`
+        : `Переместить мониторинг${title} в архив и удалить его публичные ссылки? Файлы останутся в папке архива.`
+      if (!window.confirm(confirmation)) return
       await api(`/campaigns/${encodeURIComponent(campaignId)}/archive`, { method: "POST" })
       if (state.selectedCampaignId === campaignId) {
         state.selectedCampaignId = ""
@@ -2024,8 +2089,23 @@
           setNotice("Список групп обновлён")
         } else if (target.dataset.download) {
           await download(target.dataset.download)
+        } else if (target.dataset.resumeMail) {
+          target.disabled = true
+          try {
+            state.lastBatch = await api(`/message-batches/${encodeURIComponent(target.dataset.resumeMail)}/send`, { method: "POST" })
+            await loadBase()
+            render()
+          } finally {
+            target.disabled = false
+          }
         } else if (target.dataset.op) {
-          await runOperation(target.dataset.op)
+          const sendingMail = ["messages-send", "messages-all-links-send"].includes(target.dataset.op)
+          if (sendingMail) target.disabled = true
+          try {
+            await runOperation(target.dataset.op)
+          } finally {
+            if (sendingMail) target.disabled = false
+          }
         }
       } catch (error) {
         setNotice(error.message, true)
